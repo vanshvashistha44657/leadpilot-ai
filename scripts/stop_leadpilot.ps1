@@ -40,16 +40,34 @@ function Test-KnownLeadPilotInstallation {
 }
 
 function Stop-OwnedFrontend {
-  param([string]$ApplicationRoot)
+  param(
+    [string]$ApplicationRoot,
+    [string]$DataRoot
+  )
 
   $frontendPath = [IO.Path]::GetFullPath((Join-Path $ApplicationRoot "LeadPilot\leadpilot_frontend.exe"))
-  if (-not (Test-Path -LiteralPath $frontendPath -PathType Leaf)) { return }
+  $metadataPath = Join-Path (Join-Path $DataRoot "runtime") "frontend.process.json"
+  if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { return }
 
-  $processes = @(Get-Process -Name "leadpilot_frontend" -ErrorAction SilentlyContinue)
-  foreach ($process in $processes) {
-    if ($process.HasExited) { continue }
-    $actualPath = Get-ProcessPath $process
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualPath, $frontendPath)) { continue }
+  try {
+    $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+    $recordedPath = [IO.Path]::GetFullPath([string]$metadata.executable)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($recordedPath, $frontendPath)) {
+      throw "Refusing to stop a frontend whose recorded executable is not this LeadPilot installation."
+    }
+    $process = Get-Process -Id ([int]$metadata.pid) -ErrorAction SilentlyContinue
+    if ($null -eq $process -or $process.HasExited) {
+      Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
+      return
+    }
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals((Get-ProcessPath $process), $recordedPath)) {
+      throw "Refusing to stop a frontend whose process path does not match its ownership record."
+    }
+    $recordedStart = [DateTimeOffset]::Parse([string]$metadata.started_at_utc)
+    $actualStart = [DateTimeOffset]$process.StartTime.ToUniversalTime()
+    if ([Math]::Abs(($actualStart - $recordedStart).TotalSeconds) -gt 15) {
+      throw "Refusing to stop a frontend whose start time does not match its ownership record."
+    }
     if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
       $null = $process.CloseMainWindow()
       $null = $process.WaitForExit(5000)
@@ -61,6 +79,9 @@ function Stop-OwnedFrontend {
     if (-not $process.HasExited) {
       throw "LeadPilot frontend PID $($process.Id) did not exit."
     }
+    Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
+  } catch {
+    throw $_
   }
 }
 
@@ -86,7 +107,7 @@ if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
 $dataRoot = ConvertTo-FullPath $DataDirectory
 $metadataPath = Join-Path $dataRoot "runtime\backend.process.json"
 if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
-  if ($StopFrontend) { Stop-OwnedFrontend $root }
+  if ($StopFrontend) { Stop-OwnedFrontend $root $dataRoot }
   Write-Host "No LeadPilot backend ownership record found. No backend process was stopped."
   exit 0
 }
@@ -101,7 +122,7 @@ try {
 $process = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
 if ($null -eq $process -or $process.HasExited) {
   Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
-  if ($StopFrontend) { Stop-OwnedFrontend $root }
+  if ($StopFrontend) { Stop-OwnedFrontend $root $dataRoot }
   Write-Host "LeadPilot backend process is not running."
   exit 0
 }
@@ -138,5 +159,5 @@ if (-not $process.HasExited) {
   throw "LeadPilot backend PID $backendPid did not exit after the stop request."
 }
 Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
-if ($StopFrontend) { Stop-OwnedFrontend $root }
+if ($StopFrontend) { Stop-OwnedFrontend $root $dataRoot }
 Write-Host "Stopped LeadPilot backend PID $backendPid."

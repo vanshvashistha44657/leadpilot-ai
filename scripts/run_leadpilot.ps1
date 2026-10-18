@@ -152,6 +152,29 @@ function Stop-TrackedProcess {
   }
 }
 
+function Remove-FrontendMetadataIfOwned {
+  param(
+    [string]$MetadataPath,
+    [System.Diagnostics.Process]$Process,
+    [string]$ExpectedExecutable
+  )
+
+  if (-not (Test-Path -LiteralPath $MetadataPath)) { return }
+  try {
+    $metadata = Get-Content -LiteralPath $MetadataPath -Raw | ConvertFrom-Json
+    $sameProcess = $null -ne $Process -and [int]$metadata.pid -eq $Process.Id
+    $sameExecutable = [StringComparer]::OrdinalIgnoreCase.Equals(
+      [IO.Path]::GetFullPath([string]$metadata.executable),
+      $ExpectedExecutable
+    )
+    if ($sameProcess -and $sameExecutable) {
+      Remove-Item -LiteralPath $MetadataPath -Force -ErrorAction SilentlyContinue
+    }
+  } catch {
+    # A stale frontend record must not prevent backend cleanup.
+  }
+}
+
 function Invoke-ApiCheck {
   param(
     [string]$Uri,
@@ -212,6 +235,7 @@ $logsDirectory = Join-Path $dataRoot "logs"
 $runtimeDirectory = Join-Path $dataRoot "runtime"
 $configFile = Join-Path $configDirectory "backend.env"
 $metadataPath = Join-Path $runtimeDirectory "backend.process.json"
+$frontendMetadataPath = Join-Path $runtimeDirectory "frontend.process.json"
 $stdout = Join-Path $logsDirectory "backend.stdout.log"
 $stderr = Join-Path $logsDirectory "backend.stderr.log"
 $databasePath = Join-Path $dataPath "leadpilot.db"
@@ -320,9 +344,19 @@ try {
     $env:LEADPILOT_API_URL = "http://127.0.0.1:$Port"
     $env:LEADPILOT_LOCAL_TOKEN = $LocalToken
     $frontendProcess = Start-Process -FilePath $frontendExecutable -WorkingDirectory (Split-Path -Parent $frontendExecutable) -PassThru
-    $null = $frontendProcess.WaitForExit()
-    if ($frontendProcess.ExitCode -ne 0) {
-      throw "LeadPilot frontend exited with code $($frontendProcess.ExitCode)."
+    $frontendMetadata = [ordered]@{
+      pid = $frontendProcess.Id
+      executable = [IO.Path]::GetFullPath($frontendExecutable)
+      started_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+    }
+    $frontendMetadata | ConvertTo-Json | Set-Content -LiteralPath $frontendMetadataPath -Encoding ascii
+    try {
+      $null = $frontendProcess.WaitForExit()
+      if ($frontendProcess.ExitCode -ne 0) {
+        throw "LeadPilot frontend exited with code $($frontendProcess.ExitCode)."
+      }
+    } finally {
+      Remove-FrontendMetadataIfOwned $frontendMetadataPath $frontendProcess ([IO.Path]::GetFullPath($frontendExecutable))
     }
   } elseif ($LaunchFlutter) {
     if ($null -eq (Get-Command flutter -ErrorAction SilentlyContinue)) {

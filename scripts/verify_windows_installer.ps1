@@ -69,6 +69,31 @@ function Get-InstalledShortcut {
   return $null
 }
 
+function Get-TrackedFrontend {
+  param(
+    [string]$InstallDirectory,
+    [string]$DataDirectory
+  )
+
+  $metadataPath = Join-Path $DataDirectory "runtime\frontend.process.json"
+  if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { return $null }
+  try {
+    $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+    $expected = [IO.Path]::GetFullPath((Join-Path $InstallDirectory "LeadPilot\leadpilot_frontend.exe"))
+    $recorded = [IO.Path]::GetFullPath([string]$metadata.executable)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($recorded, $expected)) { return $null }
+    $process = Get-Process -Id ([int]$metadata.pid) -ErrorAction SilentlyContinue
+    if ($null -eq $process -or $process.HasExited) { return $null }
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($process.Path), $expected)) { return $null }
+    $recordedStart = [DateTimeOffset]::Parse([string]$metadata.started_at_utc)
+    $actualStart = [DateTimeOffset]$process.StartTime.ToUniversalTime()
+    if ([Math]::Abs(($actualStart - $recordedStart).TotalSeconds) -gt 15) { return $null }
+    return $process
+  } catch {
+    return $null
+  }
+}
+
 function Assert-LauncherShortcut {
   param([string]$ShortcutPath)
 
@@ -95,50 +120,47 @@ function Invoke-PackagedVerification {
   }
 }
 
-function Find-OwnedFrontend {
-  param([string]$InstallDirectory)
-
-  $expected = [IO.Path]::GetFullPath((Join-Path $InstallDirectory "LeadPilot\leadpilot_frontend.exe"))
-  foreach ($process in @(Get-Process -Name "leadpilot_frontend" -ErrorAction SilentlyContinue)) {
-    try {
-      if (-not $process.HasExited -and [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($process.Path), $expected)) {
-        return $process
-      }
-    } catch { }
-  }
-  return $null
-}
-
 function Invoke-FrontendSmoke {
-  param([string]$InstallDirectory, [int]$CheckPort)
+  param([string]$InstallDirectory, [string]$DataDirectory, [int]$CheckPort)
 
   $launcher = Join-Path $InstallDirectory "scripts\run_leadpilot.ps1"
   $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '" -InstallRoot "' + $InstallDirectory + '" -Port ' + $CheckPort + ' -LaunchFrontend'
   $launcherProcess = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -PassThru
+  $script:ActiveLauncherProcess = $launcherProcess
+  $script:ActiveInstallDirectory = $InstallDirectory
+  $script:ActiveDataDirectory = $DataDirectory
   $frontend = $null
   for ($attempt = 0; $attempt -lt 60; $attempt++) {
     Start-Sleep -Milliseconds 500
-    $frontend = Find-OwnedFrontend $InstallDirectory
+    $frontend = Get-TrackedFrontend $InstallDirectory $DataDirectory
     if ($null -ne $frontend -or $launcherProcess.HasExited) { break }
   }
   if ($null -eq $frontend) {
     if (-not $launcherProcess.HasExited) { Stop-Process -Id $launcherProcess.Id -Force -ErrorAction SilentlyContinue }
-    throw "Installed launcher did not start the packaged Flutter frontend."
+    $exitCode = if ($launcherProcess.HasExited) { $launcherProcess.ExitCode } else { "running" }
+    throw "Installed launcher did not publish its owned packaged Flutter frontend (launcher state: $exitCode)."
   }
+  $script:ActiveFrontendProcess = $frontend
 
   Start-Sleep -Seconds 3
-  $null = $frontend.CloseMainWindow()
+  $closeRequested = $frontend.CloseMainWindow()
   $graceful = $frontend.WaitForExit(10000)
   if (-not $graceful -and -not $frontend.HasExited) {
     Stop-Process -Id $frontend.Id -Force
+    $null = $frontend.WaitForExit(5000)
   }
   $null = $launcherProcess.WaitForExit(15000)
-  if (-not $launcherProcess.HasExited -or $launcherProcess.ExitCode -ne 0) {
-    throw "Installed launcher did not cleanly exit after the frontend closed."
-  }
   if (-not $graceful) {
-    throw "Installed Flutter frontend required a forced close during the smoke test."
+    throw "Owned packaged Flutter frontend did not exit gracefully after CloseMainWindow returned $closeRequested."
   }
+  if (-not $launcherProcess.HasExited) {
+    throw "Installed launcher did not exit after its owned frontend process closed."
+  }
+  if ($launcherProcess.ExitCode -ne 0) {
+    throw "Installed launcher exited with code $($launcherProcess.ExitCode) after its owned frontend process closed."
+  }
+  $script:ActiveFrontendProcess = $null
+  $script:ActiveLauncherProcess = $null
 }
 
 function Invoke-BackendOnlyStart {
@@ -162,6 +184,80 @@ function Assert-NoPackageSecrets {
   }
 }
 
+function Stop-TestOwnedFrontend {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string]$InstallDirectory
+  )
+
+  if ($null -eq $Process -or $Process.HasExited) { return }
+  $expected = [IO.Path]::GetFullPath((Join-Path $InstallDirectory "LeadPilot\leadpilot_frontend.exe"))
+  try {
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($Process.Path), $expected)) {
+      return
+    }
+    $null = $Process.CloseMainWindow()
+    $null = $Process.WaitForExit(5000)
+    if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
+    $null = $Process.WaitForExit(5000)
+  } catch { }
+}
+
+function Stop-TestOwnedBackendFromMetadata {
+  param([string]$DataDirectory)
+
+  $metadataPath = Join-Path (Join-Path $DataDirectory "runtime") "backend.process.json"
+  if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { return }
+  try {
+    $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+    $process = Get-Process -Id ([int]$metadata.pid) -ErrorAction SilentlyContinue
+    if ($null -eq $process -or $process.HasExited) {
+      Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
+      return
+    }
+    $recordedPath = [IO.Path]::GetFullPath([string]$metadata.executable)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($process.Path), $recordedPath)) { return }
+    $recordedStart = [DateTimeOffset]::Parse([string]$metadata.started_at_utc)
+    $actualStart = [DateTimeOffset]$process.StartTime.ToUniversalTime()
+    if ([Math]::Abs(($actualStart - $recordedStart).TotalSeconds) -gt 15) { return }
+    Stop-Process -Id $process.Id -Force
+    $null = $process.WaitForExit(5000)
+    if ($process.HasExited) {
+      Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
+    }
+  } catch { }
+}
+
+function Invoke-TestOwnedCleanup {
+  param(
+    [string]$InstallDirectory,
+    [string]$DataDirectory
+  )
+
+  $frontend = $script:ActiveFrontendProcess
+  if ($null -eq $frontend) { $frontend = Get-TrackedFrontend $InstallDirectory $DataDirectory }
+  Stop-TestOwnedFrontend $frontend $InstallDirectory
+
+  $stopScript = Join-Path $InstallDirectory "scripts\stop_leadpilot.ps1"
+  if (Test-Path -LiteralPath $stopScript -PathType Leaf) {
+    try {
+      & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $stopScript -InstallRoot $InstallDirectory -DataDirectory $DataDirectory -StopFrontend
+    } catch { }
+  }
+  Stop-TestOwnedBackendFromMetadata $DataDirectory
+
+  $launcher = $script:ActiveLauncherProcess
+  if ($null -ne $launcher -and -not $launcher.HasExited) {
+    try { $null = $launcher.WaitForExit(5000) } catch { }
+    if (-not $launcher.HasExited) {
+      Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
+      try { $null = $launcher.WaitForExit(5000) } catch { }
+    }
+  }
+  $script:ActiveFrontendProcess = $null
+  $script:ActiveLauncherProcess = $null
+}
+
 $installer = ConvertTo-FullPath $InstallerPath
 Assert-Path $installer
 if ([string]::IsNullOrWhiteSpace($TestRoot)) {
@@ -176,6 +272,8 @@ $testLocalAppData = Join-Path $testRoot "LocalAppData"
 $userData = Join-Path $testLocalAppData "LeadPilot"
 $oldLocalAppData = $env:LOCALAPPDATA
 $oldDataOverride = $env:LEADPILOT_DATA_DIRECTORY
+$script:ActiveFrontendProcess = $null
+$script:ActiveLauncherProcess = $null
 
 try {
   New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
@@ -212,8 +310,8 @@ try {
   }
   Invoke-PackagedVerification $installDirectory ($Port + 2)
 
-  Invoke-FrontendSmoke $installDirectory ($Port + 3)
-  Invoke-FrontendSmoke $installDirectory ($Port + 4)
+  Invoke-FrontendSmoke $installDirectory $userData ($Port + 3)
+  Invoke-FrontendSmoke $installDirectory $userData ($Port + 4)
   Invoke-BackendOnlyStart $installDirectory ($Port + 5)
   Invoke-Uninstaller $installDirectory $userData
 
@@ -229,6 +327,7 @@ try {
 
   Write-Host "Windows installer smoke verification passed: install, launcher contract, frontend launch, upgrade, backend shutdown, uninstall, and data preservation."
 } finally {
+  Invoke-TestOwnedCleanup $installDirectory $userData
   if ($null -eq $oldLocalAppData) { Remove-Item Env:LOCALAPPDATA -ErrorAction SilentlyContinue } else { $env:LOCALAPPDATA = $oldLocalAppData }
   if ($null -eq $oldDataOverride) { Remove-Item Env:LEADPILOT_DATA_DIRECTORY -ErrorAction SilentlyContinue } else { $env:LEADPILOT_DATA_DIRECTORY = $oldDataOverride }
   if (-not $KeepTestRoot -and (Test-Path -LiteralPath $testRoot)) {
