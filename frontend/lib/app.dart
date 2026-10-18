@@ -88,7 +88,7 @@ class _AppShellState extends State<AppShell> {
             body: Row(
               children: [
                 Container(
-                  width: extended ? 238 : 82,
+                  width: extended ? 260 : 82,
                   decoration: BoxDecoration(
                     color: Theme.of(context).navigationRailTheme.backgroundColor,
                     border: Border(right: BorderSide(color: Theme.of(context).dividerColor)),
