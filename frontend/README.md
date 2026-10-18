@@ -49,7 +49,9 @@ pricing package library; AI personalization only runs through the configured
 backend provider, while Gmail live sending remains backend-gated. Outreach
 actions in this shell are explicitly dry-run only.
 
-Flutter/Dart checks could not be run in the source workspace because the SDK
-and Windows build toolchain are not installed in this environment. After
-installing them, run `flutter analyze`, `flutter test`, and
-`flutter build windows --release`.
+The current Windows workspace has Flutter 3.47.7, Dart 3.13.5, and the Visual
+Studio Windows toolchain installed. `flutter analyze`, `flutter test`, and
+`flutter build windows --release` have passed. The packaged desktop shell
+receives `LEADPILOT_API_URL` and `LEADPILOT_LOCAL_TOKEN` from the installed
+PowerShell launcher; do not launch `leadpilot_frontend.exe` directly for an
+installed run.

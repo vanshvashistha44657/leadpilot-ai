@@ -2,6 +2,7 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 *.egg-info/
+build/
 data/*.db
 data/*.db-*
 backups/*.db

@@ -15,6 +15,7 @@ backend/
     repositories.py           persistence boundary
   tests/                      pytest API and service tests
   pyproject.toml
+  requirements-runtime.txt    pinned dependencies for the bundled runtime
   .env.example
 frontend/
   lib/                        Flutter desktop UI, typed API client, screens
@@ -25,7 +26,13 @@ scripts/
   run_leadpilot.ps1           backend readiness/process manager and optional Flutter launch
   stop_leadpilot.ps1          backend process stop helper
   build_windows.ps1           reproducible Flutter Windows build helper
+  prepare_python_runtime.ps1  private Python 3.12 runtime preparation
   package_windows.ps1         portable release staging helper
+  verify_windows_package.ps1  package lifecycle/readiness smoke check
+  build_windows_installer.ps1 Inno Setup compiler wrapper
+  verify_windows_installer.ps1 install/upgrade/uninstall smoke check
+packaging/windows/
+  LeadPilot.iss              Inno Setup installer definition
 ```
 
 ## Implemented safe workflows
@@ -179,24 +186,96 @@ restore over a running database.
 
 ## Windows packaging
 
-After Visual Studio finishes installing and generating Windows runners if needed:
+The Windows work is delivered in small, testable phases. The package staging
+directory contains the Flutter release, a private Python 3.12 runtime, pinned
+backend runtime dependencies, and installed-layout launch/stop helpers. Phase
+2 adds the Inno Setup installer around that staging directory.
+
+After Visual Studio and the Flutter Windows toolchain are available:
 
 ```powershell
-cd frontend
-flutter create --platforms=windows --empty .
-flutter build windows --release
+.\scripts\build_windows.ps1
+.\scripts\package_windows.ps1 -PythonExecutable "C:\Path\To\Python312\python.exe"
+.\scripts\verify_windows_package.ps1 -PackageDirectory .\dist\leadpilot-windows
+.\scripts\build_windows_installer.ps1 -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 ```
 
-`scripts/build_windows.ps1` checks for Flutter, generates a missing Windows runner with the empty template (so it does not add a stock app/test), runs `flutter pub get`, `flutter analyze`, `flutter test`, and produces the release build. `scripts/package_windows.ps1` stages a verified Flutter release alongside the backend source and configuration template, but does not sign binaries or create an installer. A production installer still needs a selected packaging strategy (MSIX/Inno Setup/WiX), embedded Python runtime policy, firewall rules for localhost, code signing, upgrade/migration handling, and a release test on a clean Windows machine.
+`package_windows.ps1` copies the release output from
+`frontend\build\windows\x64\runner\Release`, provisions a self-contained
+Python 3.12 directory, and installs the pinned dependencies in
+`backend\requirements-runtime.txt`. The build machine needs Python 3.12 and
+network access to resolve those pinned wheels; the installed user does not
+need Python or Flutter.
 
-The verified Flutter output, once the command succeeds, is
-`frontend\build\windows\x64\runner\Release`. For an installer, stage the
-Flutter release plus the selected Python 3.12 runtime, backend package, a
-launcher that starts Uvicorn on `127.0.0.1` with a generated local token, and a
-shutdown handler. Then package that staging directory with MSIX, Inno Setup,
-or WiX and test install/upgrade/uninstall on a clean Windows VM. The Python
-runtime bundling and code-signing steps are intentionally not claimed as
-verified here.
+For a portable staging run, launch the package with:
+
+```powershell
+.\dist\leadpilot-windows\scripts\run_leadpilot.ps1 `
+  -InstallRoot .\dist\leadpilot-windows `
+  -LaunchFrontend
+```
+
+The launcher starts Uvicorn on `127.0.0.1`, waits for `/health/ready`, verifies
+an authenticated API request, then starts the packaged Flutter executable. A
+random local API token is generated in memory and inherited by both processes;
+it is never written to a file, passed on the command line, or printed. Closing
+the frontend stops only the backend process owned by that launcher. The
+standalone `stop_leadpilot.ps1` helper verifies the recorded executable path
+and process start time before stopping anything.
+
+Persistent data is kept outside the replaceable package directory under
+`%LOCALAPPDATA%\LeadPilot`:
+
+```text
+config\backend.env          user configuration and provider settings
+data\leadpilot.db           SQLite database
+backups\                    database backups
+logs\                       backend stdout/stderr
+runtime\backend.process.json process ownership metadata only
+```
+
+The installer is built from `packaging\windows\LeadPilot.iss`. It provides an
+installation-directory page, a Start Menu shortcut, an unchecked optional
+Desktop shortcut, and a checked optional launch-after-install checkbox. Every
+shortcut targets Windows PowerShell and `scripts\run_leadpilot.ps1`; shortcuts
+never target the Flutter executable directly because the launcher owns backend
+startup and the environment-variable authentication contract.
+
+The installer defaults to `C:\Program Files\LeadPilot AI` and rejects an
+installation directory that overlaps `%LOCALAPPDATA%\LeadPilot`. The installer
+stops only the recorded LeadPilot backend and packaged frontend before an
+upgrade or uninstall. It does not add any uninstall rule for user data.
+
+The launcher always enforces `LOCAL_ONLY_API=true`, `DRY_RUN=true`,
+`LIVE_SENDING_ENABLED=false`, and disabled Gmail live-send approval flags.
+Provider credentials remain environment-only; the launcher does not write them
+to the persistent configuration file.
+Upgrades replace only the package directory and preserve `%LOCALAPPDATA%\LeadPilot`.
+Uninstall stops owned processes, removes application files and shortcuts, and
+preserves `%LOCALAPPDATA%\LeadPilot`. Data deletion is intentionally not
+offered by the installer; remove it manually only after making a backup and
+confirming the path.
+
+After compiling an installer, run the realistic lifecycle verifier on an
+isolated Windows machine or runner:
+
+```powershell
+.\scripts\verify_windows_installer.ps1 -InstallerPath .\dist\LeadPilot-Setup.exe
+```
+
+That check installs into a temporary path containing spaces, validates the
+launcher-targeted shortcuts, launches the actual Flutter executable, performs
+an upgrade while the backend is running, uninstalls, and confirms the database,
+configuration, and marker data remain. It is destructive only inside its
+unique temporary test root. If Windows elevation or the runner cannot create
+or close a desktop GUI, perform the same test manually: install with the
+Desktop shortcut selected, launch from Start Menu, close the window, repeat
+while the backend is running, then uninstall and verify that
+`%LOCALAPPDATA%\LeadPilot` remains.
+
+The Inno Setup compiler is not installed on this development machine. It is
+installed automatically in GitHub Actions for the installer job; the unrelated
+backend and Flutter tests do not require Inno Setup.
 
 ## macOS plan
 
@@ -233,55 +312,45 @@ Flutter 3.47.7 at C:\src\flutter: verified
 Dart 3.13.5: verified
 flutter pub get: passed
 flutter analyze: passed with no issues
-flutter test: blocked before execution by Windows Application Control/WDAC when launching flutter_tester.exe
-flutter build windows --release: blocked because Visual Studio C++ toolchain is not yet registered by vswhere
+flutter test: passed (3 tests)
+flutter build windows --release: passed
 ```
 
-The frontend is dependency-light and source-complete. A verified Windows desktop build still requires the Visual Studio installation to finish and the local Application Control policy to allow `C:\src\flutter\bin\cache\artifacts\engine\windows-x64\flutter_tester.exe` for Flutter tests. macOS builds remain untested.
+The frontend is dependency-light and source-complete. macOS builds remain
+untested. The Windows package staging check is also verified locally with
+Python 3.12.10 and the generated release executable.
 
 ## Private GitHub CI
 
-The repository now includes `.github/workflows/ci.yml`. It uses two isolated
+The repository now includes `.github/workflows/ci.yml`. It uses three isolated
 GitHub-hosted Windows jobs and does not require project secrets:
 
 - `backend`: Python 3.12, editable test installation, `compileall`, and all
   backend pytest cases.
 - `flutter`: stable Flutter `3.47.7`, `flutter doctor -v`, `flutter pub get`,
   `flutter analyze`, `flutter test`, and `flutter build windows --release`.
+- `package-staging`: repeats the Windows release build, provisions the private
+  Python runtime, runs `verify_windows_package.ps1`, installs Inno Setup 6.7.1,
+  compiles `LeadPilot-Setup.exe`, runs `verify_windows_installer.ps1`, and
+  uploads both the staging archive and the installer artifact.
 
-The CI runner is separate from the local Windows machine, so the local
-Smart App Control/WDAC block on `flutter_tester.exe` is not disabled or
-modified. CI results are only authoritative after the workflow runs on GitHub;
-no CI result is claimed from this workspace before a push.
+The installer job installs Inno Setup automatically on `windows-latest`; local
+backend and Flutter tests do not require Inno Setup.
 
-### Create a private repository without publishing from this CLI
+The latest completed workflow for commit `8fa90a7` passed the original backend
+and Flutter checks. The Phase 2 installer job has not run against this working
+tree until the changes are pushed to GitHub.
 
-The current workspace is not a Git repository and has no configured remote.
-The following commands are instructions for the operator; they were not run:
+### Repository state
 
-```powershell
-cd "C:\Users\vansh\Desktop\ai automation for cold mailing"
-git init -b main
-git config user.name "Your Name"
-git config user.email "you@example.com"
-git status --short
-```
-
-Before staging, inspect the output and confirm that no dataset, SQLite file,
-runtime log, `dist/` output, `.env`, OAuth token, API key, or other private
-material appears. The root `.gitignore` excludes generated build/staging output
-and backend runtime data, but the operator should still review `git status`.
-
-Create an empty **private** repository through GitHub's website, then connect
-and push only after reviewing the staged file list:
+This workspace is connected to the private GitHub repository
+`vanshvashistha44657/leadpilot-ai` on `main`. Do not commit provider secrets,
+SQLite databases, runtime logs, generated `dist/` output, or local `.env`
+files. Review `git status --short` and the staged file list before every push.
 
 ```powershell
-git remote add origin https://github.com/<owner>/<private-repository>.git
-git add .github README.md .gitignore backend frontend scripts
 git status --short
-git commit -m "ci: add Windows Flutter and backend checks"
-git branch -M main
-git push -u origin main
+git diff --check
 ```
 
 Alternatively, after installing and authenticating GitHub CLI with `gh auth

@@ -66,3 +66,79 @@ jobs:
 
       - name: Build Windows release
         run: flutter build windows --release
+
+  package-staging:
+    name: Build and verify Windows installer
+    runs-on: windows-latest
+    needs: [backend, flutter]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements-runtime.txt
+
+      - name: Set up Flutter 3.47.7
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+          cache: true
+
+      - name: Build Flutter Windows release
+        working-directory: frontend
+        run: |
+          flutter pub get
+          flutter build windows --release
+
+      - name: Prepare bundled Python package
+        shell: pwsh
+        run: |
+          $python = (Get-Command python.exe -ErrorAction Stop).Source
+          & .\scripts\package_windows.ps1 -PythonExecutable $python
+
+      - name: Run packaged backend lifecycle smoke check
+        shell: pwsh
+        run: |
+          & .\scripts\verify_windows_package.ps1 -PackageDirectory .\dist\leadpilot-windows -Port 18000
+
+      - name: Install Inno Setup 6.7.1
+        shell: pwsh
+        run: choco install innosetup --version=6.7.1 --no-progress --yes
+
+      - name: Build LeadPilot installer
+        shell: pwsh
+        run: |
+          $compiler = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+            throw "Inno Setup compiler was not installed at $compiler"
+          }
+          & .\scripts\build_windows_installer.ps1 -InnoSetupCompiler $compiler
+
+      - name: Verify installed lifecycle
+        shell: pwsh
+        run: |
+          & .\scripts\verify_windows_installer.ps1 -InstallerPath .\dist\LeadPilot-Setup.exe -Port 18100
+
+      - name: Archive Phase 1 Windows staging package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path .\dist\leadpilot-windows -DestinationPath .\dist\leadpilot-windows-phase1.zip -Force
+
+      - name: Upload Phase 1 Windows staging package
+        uses: actions/upload-artifact@v4
+        with:
+          name: leadpilot-windows-phase1-staging
+          path: dist/leadpilot-windows-phase1.zip
+          if-no-files-found: error
+
+      - name: Upload LeadPilot installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: leadpilot-windows-installer
+          path: dist/LeadPilot-Setup.exe
+          if-no-files-found: error

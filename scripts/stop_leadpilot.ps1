@@ -1,15 +1,142 @@
+param(
+  [string]$InstallRoot = "",
+  [string]$DataDirectory = "",
+  [switch]$StopFrontend
+)
+
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSScriptRoot
-$pidFile = Join-Path $root "backend\data\runtime\backend.pid"
-if (-not (Test-Path -LiteralPath $pidFile)) {
-  Write-Host "No LeadPilot backend PID file found."
+
+function ConvertTo-FullPath {
+  param([string]$PathValue)
+
+  if ([IO.Path]::IsPathRooted($PathValue)) {
+    return [IO.Path]::GetFullPath($PathValue)
+  }
+  return [IO.Path]::GetFullPath((Join-Path (Get-Location) $PathValue))
+}
+
+function Get-ProcessPath {
+  param([System.Diagnostics.Process]$Process)
+
+  try {
+    return [IO.Path]::GetFullPath($Process.Path)
+  } catch {
+    return ""
+  }
+}
+
+function Test-KnownLeadPilotInstallation {
+  param([string]$ExecutablePath)
+
+  try {
+    $pythonDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($ExecutablePath))
+    $runtimeDirectory = Split-Path -Parent $pythonDirectory
+    $applicationRoot = Split-Path -Parent $runtimeDirectory
+    return (Test-Path -LiteralPath (Join-Path $applicationRoot "backend\app\main.py") -PathType Leaf) -and
+      (Test-Path -LiteralPath (Join-Path $applicationRoot "LeadPilot\leadpilot_frontend.exe") -PathType Leaf)
+  } catch {
+    return $false
+  }
+}
+
+function Stop-OwnedFrontend {
+  param([string]$ApplicationRoot)
+
+  $frontendPath = [IO.Path]::GetFullPath((Join-Path $ApplicationRoot "LeadPilot\leadpilot_frontend.exe"))
+  if (-not (Test-Path -LiteralPath $frontendPath -PathType Leaf)) { return }
+
+  $processes = @(Get-Process -Name "leadpilot_frontend" -ErrorAction SilentlyContinue)
+  foreach ($process in $processes) {
+    if ($process.HasExited) { continue }
+    $actualPath = Get-ProcessPath $process
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualPath, $frontendPath)) { continue }
+    if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
+      $null = $process.CloseMainWindow()
+      $null = $process.WaitForExit(5000)
+    }
+    if (-not $process.HasExited) {
+      Stop-Process -Id $process.Id -Force
+      $null = $process.WaitForExit(5000)
+    }
+    if (-not $process.HasExited) {
+      throw "LeadPilot frontend PID $($process.Id) did not exit."
+    }
+  }
+}
+
+$root = if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+  ConvertTo-FullPath (Join-Path $PSScriptRoot "..")
+} else {
+  ConvertTo-FullPath $InstallRoot
+}
+$expectedExecutable = Join-Path $root "runtime\python\python.exe"
+if (-not (Test-Path -LiteralPath $expectedExecutable -PathType Leaf)) {
+  $command = Get-Command python -ErrorAction SilentlyContinue
+  if ($null -ne $command) { $expectedExecutable = [IO.Path]::GetFullPath($command.Source) }
+}
+
+if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
+  if (-not [string]::IsNullOrWhiteSpace($env:LEADPILOT_DATA_DIRECTORY)) {
+    $DataDirectory = $env:LEADPILOT_DATA_DIRECTORY
+  } else {
+    $localAppData = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $env:TEMP } else { $env:LOCALAPPDATA }
+    $DataDirectory = Join-Path $localAppData "LeadPilot"
+  }
+}
+$dataRoot = ConvertTo-FullPath $DataDirectory
+$metadataPath = Join-Path $dataRoot "runtime\backend.process.json"
+if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+  if ($StopFrontend) { Stop-OwnedFrontend $root }
+  Write-Host "No LeadPilot backend ownership record found. No backend process was stopped."
   exit 0
 }
-$backendPid = Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue
-if ($backendPid -and (Get-Process -Id ([int]$backendPid) -ErrorAction SilentlyContinue)) {
-  Stop-Process -Id ([int]$backendPid) -Force
-  Write-Host "Stopped LeadPilot backend PID $backendPid."
-} else {
-  Write-Host "LeadPilot backend process is not running."
+
+try {
+  $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+  $backendPid = [int]$metadata.pid
+} catch {
+  throw "The LeadPilot backend ownership record is invalid. No process was stopped: $metadataPath"
 }
-Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+
+$process = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
+if ($null -eq $process -or $process.HasExited) {
+  Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
+  if ($StopFrontend) { Stop-OwnedFrontend $root }
+  Write-Host "LeadPilot backend process is not running."
+  exit 0
+}
+
+$recordedExecutable = [string]$metadata.executable
+if ([string]::IsNullOrWhiteSpace($recordedExecutable)) {
+  $recordedExecutable = $expectedExecutable
+}
+$recordedExecutable = [IO.Path]::GetFullPath($recordedExecutable)
+if (-not (Test-KnownLeadPilotInstallation $recordedExecutable)) {
+  throw "Refusing to stop PID $backendPid because its recorded LeadPilot installation is not available."
+}
+$actualExecutable = Get-ProcessPath $process
+if ([string]::IsNullOrWhiteSpace($actualExecutable) -or
+    -not [StringComparer]::OrdinalIgnoreCase.Equals($actualExecutable, $recordedExecutable)) {
+  throw "Refusing to stop PID $backendPid because it is not the LeadPilot Python runtime recorded by this application."
+}
+
+try {
+  $recordedStart = [DateTimeOffset]::Parse([string]$metadata.started_at_utc)
+  $actualStart = [DateTimeOffset]$process.StartTime.ToUniversalTime()
+  if ([Math]::Abs(($actualStart - $recordedStart).TotalSeconds) -gt 15) {
+    throw "Refusing to stop PID $backendPid because its start time does not match the LeadPilot ownership record."
+  }
+} catch [System.Management.Automation.RuntimeException] {
+  throw
+} catch {
+  throw "Refusing to stop PID $backendPid because its start time could not be verified."
+}
+
+Stop-Process -Id $backendPid -Force
+try { $null = $process.WaitForExit(5000) } catch { }
+if (-not $process.HasExited) {
+  throw "LeadPilot backend PID $backendPid did not exit after the stop request."
+}
+Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
+if ($StopFrontend) { Stop-OwnedFrontend $root }
+Write-Host "Stopped LeadPilot backend PID $backendPid."
