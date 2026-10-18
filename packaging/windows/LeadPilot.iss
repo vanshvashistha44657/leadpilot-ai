@@ -8,10 +8,9 @@
 
 #define AppName "LeadPilot AI"
 #define AppPublisher "LeadPilot AI"
-#define AppId "{9B8DF6F4-0B54-4B0A-9D57-2E3AFB5A8C1D}"
 
 [Setup]
-AppId={#AppId}
+AppId={{9B8DF6F4-0B54-4B0A-9D57-2E3AFB5A8C1D}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
@@ -81,13 +80,25 @@ begin
     IsSameOrChildPath(SecondPath, FirstPath);
 end;
 
+function PersistentDataDirectory: string;
+var
+  CommandLineDataDirectory: string;
+begin
+  CommandLineDataDirectory := ExpandConstant('{param:leadpilotdatadir|}');
+  if CommandLineDataDirectory <> '' then
+    Result := CommandLineDataDirectory
+  else
+    Result := ExpandConstant('{localappdata}\LeadPilot');
+end;
+
 function StopInstalledLeadPilot(InstallDirectory: string): Boolean;
 var
-  StopScript, MetadataPath, Parameters: string;
+  StopScript, MetadataPath, DataDirectory, Parameters: string;
   ResultCode: Integer;
 begin
   StopScript := AddBackslash(InstallDirectory) + 'scripts\stop_leadpilot.ps1';
-  MetadataPath := ExpandConstant('{localappdata}\LeadPilot\runtime\backend.process.json');
+  DataDirectory := PersistentDataDirectory;
+  MetadataPath := AddBackslash(DataDirectory) + 'runtime\backend.process.json';
   if not FileExists(StopScript) then begin
     Result := not FileExists(MetadataPath);
     if not Result then
@@ -96,7 +107,8 @@ begin
   end;
 
   Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + StopScript +
-    '" -InstallRoot "' + InstallDirectory + '" -StopFrontend';
+    '" -InstallRoot "' + InstallDirectory + '" -DataDirectory "' +
+    DataDirectory + '" -StopFrontend';
   Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     Parameters, InstallDirectory, SW_HIDE, ewWaitUntilTerminated, ResultCode) and
     (ResultCode = 0);
@@ -133,10 +145,9 @@ begin
     Result := 'LeadPilot could not stop its owned processes before installation.';
 end;
 
-procedure CurStepChanged(CurStep: TSetupStep);
+procedure RegisterPreviousData(PreviousDataKey: Integer);
 begin
-  if CurStep = ssPostInstall then
-    SetPreviousData('InstallDir', ExpandConstant('{app}'));
+  SetPreviousData(PreviousDataKey, 'InstallDir', ExpandConstant('{app}'));
 end;
 
 function InitializeUninstall(): Boolean;

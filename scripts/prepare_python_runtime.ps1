@@ -71,6 +71,14 @@ New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
 Write-Host "Copying Python $version from $sourceHome"
 Copy-Item -Path (Join-Path $sourceHome "*") -Destination $outputPath -Recurse -Force
 
+# The installed application never runs Python's own test suite. Removing its
+# test certificates and fixtures keeps the distributable smaller and prevents
+# test-only key material from being copied into the installer.
+$pythonTests = Join-Path $outputPath "Lib\test"
+if (Test-Path -LiteralPath $pythonTests) {
+  Remove-Item -LiteralPath $pythonTests -Recurse -Force
+}
+
 $sitePackages = Join-Path $outputPath "Lib\site-packages"
 if (Test-Path -LiteralPath $sitePackages) {
   Remove-Item -LiteralPath $sitePackages -Recurse -Force

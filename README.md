@@ -102,11 +102,9 @@ The unauthenticated liveness/ready endpoints are intentionally not used to acces
 
 ## Flutter setup and Windows run
 
-Flutter and Dart are now installed locally at `C:\src\flutter` (Flutter
-3.47.7, Dart 3.13.5) and Windows desktop support is enabled. Visual Studio's
-installer is open, but `vswhere` does not yet report a completed Visual Studio
-Community installation, so the Windows C++ build remains blocked until the
-workload finishes. The installation must include:
+Flutter and Dart are installed locally at `C:\src\flutter` (Flutter 3.47.7,
+Dart 3.13.5), Windows desktop support is enabled, and the Visual Studio Windows
+toolchain is verified. A new build machine must include:
 
 1. Install the stable Flutter SDK from <https://docs.flutter.dev/get-started/install/windows/desktop> and extract it to a path such as `C:\src\flutter` (avoid protected directories).
 2. Add `C:\src\flutter\bin` to the user `PATH`, then open a new PowerShell window.
@@ -273,9 +271,11 @@ Desktop shortcut selected, launch from Start Menu, close the window, repeat
 while the backend is running, then uninstall and verify that
 `%LOCALAPPDATA%\LeadPilot` remains.
 
-The Inno Setup compiler is not installed on this development machine. It is
-installed automatically in GitHub Actions for the installer job; the unrelated
-backend and Flutter tests do not require Inno Setup.
+GitHub Actions installs Inno Setup 6.7.1 automatically for the installer job.
+This workspace also has Inno Setup 6.7.1 installed per-user for local installer
+verification, but the unrelated backend and Flutter tests do not require Inno
+Setup. On a machine without it, `build_windows_installer.ps1` reports the
+missing compiler without affecting those tests.
 
 ## macOS plan
 
@@ -318,7 +318,10 @@ flutter build windows --release: passed
 
 The frontend is dependency-light and source-complete. macOS builds remain
 untested. The Windows package staging check is also verified locally with
-Python 3.12.10 and the generated release executable.
+Python 3.12.10 and the generated release executable. Inno Setup 6.7.1 also
+compiled `dist\LeadPilot-Setup.exe`, and the installer lifecycle verifier
+passed install, launcher authentication, frontend launch, upgrade, backend
+shutdown, uninstall, and persistent-data preservation locally.
 
 ## Private GitHub CI
 

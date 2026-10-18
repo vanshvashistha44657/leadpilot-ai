@@ -26,9 +26,13 @@ function Assert-Path {
 }
 
 function Invoke-Installer {
-  param([string]$Executable, [string]$InstallDirectory)
+  param(
+    [string]$Executable,
+    [string]$InstallDirectory,
+    [string]$DataDirectory
+  )
 
-  $arguments = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="' + $InstallDirectory + '" /TASKS="desktopicon"'
+  $arguments = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="' + $InstallDirectory + '" /TASKS="desktopicon" /LEADPILOTDATADIR="' + $DataDirectory + '"'
   $process = Start-Process -FilePath $Executable -ArgumentList $arguments -Wait -PassThru
   if ($process.ExitCode -ne 0) {
     throw "Installer exited with code $($process.ExitCode)."
@@ -36,11 +40,15 @@ function Invoke-Installer {
 }
 
 function Invoke-Uninstaller {
-  param([string]$InstallDirectory)
+  param(
+    [string]$InstallDirectory,
+    [string]$DataDirectory
+  )
 
   $uninstaller = Join-Path $InstallDirectory "unins000.exe"
   Assert-Path $uninstaller
-  $process = Start-Process -FilePath $uninstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait -PassThru
+  $arguments = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LEADPILOTDATADIR="' + $DataDirectory + '"'
+  $process = Start-Process -FilePath $uninstaller -ArgumentList $arguments -Wait -PassThru
   if ($process.ExitCode -ne 0) {
     throw "Uninstaller exited with code $($process.ExitCode)."
   }
@@ -175,7 +183,7 @@ try {
   $env:LOCALAPPDATA = $testLocalAppData
   $env:LEADPILOT_DATA_DIRECTORY = $userData
 
-  Invoke-Installer $installer $installDirectory
+  Invoke-Installer $installer $installDirectory $userData
   Assert-Path (Join-Path $installDirectory "LeadPilot\leadpilot_frontend.exe")
   Assert-Path (Join-Path $installDirectory "runtime\python\python.exe")
   Assert-LauncherShortcut (Get-InstalledShortcut "LeadPilot AI.lnk")
@@ -194,7 +202,7 @@ try {
   Invoke-BackendOnlyStart $installDirectory ($Port + 1)
   $metadata = Join-Path $userData "runtime\backend.process.json"
   Assert-Path $metadata
-  Invoke-Installer $installer $installDirectory
+  Invoke-Installer $installer $installDirectory $userData
   if (Test-Path -LiteralPath $metadata) {
     throw "Upgrade left the application-owned backend running."
   }
@@ -207,7 +215,7 @@ try {
   Invoke-FrontendSmoke $installDirectory ($Port + 3)
   Invoke-FrontendSmoke $installDirectory ($Port + 4)
   Invoke-BackendOnlyStart $installDirectory ($Port + 5)
-  Invoke-Uninstaller $installDirectory
+  Invoke-Uninstaller $installDirectory $userData
 
   if (Test-Path -LiteralPath $installDirectory) {
     throw "Uninstall left the installation directory behind: $installDirectory"
