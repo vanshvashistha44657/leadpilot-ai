@@ -70,6 +70,7 @@ jobs:
   package-staging:
     name: Build and verify Windows installer
     runs-on: windows-latest
+    timeout-minutes: 30
     needs: [backend, flutter]
     steps:
       - name: Check out source
@@ -123,6 +124,14 @@ jobs:
         shell: pwsh
         run: |
           & .\scripts\verify_windows_installer.ps1 -InstallerPath .\dist\LeadPilot-Setup.exe -Port 18100
+
+      - name: Upload installer lifecycle diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leadpilot-installer-lifecycle-diagnostics
+          path: dist/installer-test-diagnostics/**
+          if-no-files-found: warn
 
       - name: Archive Phase 1 Windows staging package
         shell: pwsh

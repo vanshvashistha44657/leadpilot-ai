@@ -6,6 +6,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Write-LifecycleLog {
+  param([string]$Message)
+
+  Write-Host ("[{0}] {1}" -f (Get-Date).ToUniversalTime().ToString("o"), $Message)
+}
+
 function ConvertTo-FullPath {
   param([string]$PathValue)
 
@@ -50,6 +56,7 @@ function Stop-OwnedFrontend {
   if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { return }
 
   try {
+    Write-LifecycleLog "START owned frontend stop"
     $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
     $recordedPath = [IO.Path]::GetFullPath([string]$metadata.executable)
     if (-not [StringComparer]::OrdinalIgnoreCase.Equals($recordedPath, $frontendPath)) {
@@ -80,6 +87,7 @@ function Stop-OwnedFrontend {
       throw "LeadPilot frontend PID $($process.Id) did not exit."
     }
     Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
+    Write-LifecycleLog "END owned frontend stop"
   } catch {
     throw $_
   }
@@ -108,7 +116,7 @@ $dataRoot = ConvertTo-FullPath $DataDirectory
 $metadataPath = Join-Path $dataRoot "runtime\backend.process.json"
 if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
   if ($StopFrontend) { Stop-OwnedFrontend $root $dataRoot }
-  Write-Host "No LeadPilot backend ownership record found. No backend process was stopped."
+  Write-LifecycleLog "No LeadPilot backend ownership record found. No backend process was stopped."
   exit 0
 }
 
@@ -123,7 +131,7 @@ $process = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
 if ($null -eq $process -or $process.HasExited) {
   Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
   if ($StopFrontend) { Stop-OwnedFrontend $root $dataRoot }
-  Write-Host "LeadPilot backend process is not running."
+  Write-LifecycleLog "LeadPilot backend process is not running."
   exit 0
 }
 
@@ -153,6 +161,7 @@ try {
   throw "Refusing to stop PID $backendPid because its start time could not be verified."
 }
 
+Write-LifecycleLog "START owned backend stop pid=$backendPid"
 Stop-Process -Id $backendPid -Force
 try { $null = $process.WaitForExit(5000) } catch { }
 if (-not $process.HasExited) {
@@ -160,4 +169,4 @@ if (-not $process.HasExited) {
 }
 Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
 if ($StopFrontend) { Stop-OwnedFrontend $root $dataRoot }
-Write-Host "Stopped LeadPilot backend PID $backendPid."
+Write-LifecycleLog "END owned backend stop pid=$backendPid"

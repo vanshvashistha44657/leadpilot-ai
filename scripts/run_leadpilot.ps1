@@ -6,7 +6,8 @@ param(
   [switch]$LaunchFrontend,
   [switch]$LaunchFlutter,
   [switch]$VerifyOnly,
-  [switch]$KeepBackend
+  [switch]$KeepBackend,
+  [int]$FrontendTimeoutSeconds = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -351,7 +352,15 @@ try {
     }
     $frontendMetadata | ConvertTo-Json | Set-Content -LiteralPath $frontendMetadataPath -Encoding ascii
     try {
-      $null = $frontendProcess.WaitForExit()
+      if ($FrontendTimeoutSeconds -gt 0) {
+        if (-not $frontendProcess.WaitForExit($FrontendTimeoutSeconds * 1000)) {
+          Stop-Process -Id $frontendProcess.Id -Force -ErrorAction SilentlyContinue
+          try { $null = $frontendProcess.WaitForExit(5000) } catch { }
+          throw "LeadPilot frontend exceeded its ${FrontendTimeoutSeconds}-second test timeout."
+        }
+      } else {
+        $null = $frontendProcess.WaitForExit()
+      }
       if ($frontendProcess.ExitCode -ne 0) {
         throw "LeadPilot frontend exited with code $($frontendProcess.ExitCode)."
       }

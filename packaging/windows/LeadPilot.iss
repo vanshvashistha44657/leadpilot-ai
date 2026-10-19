@@ -93,16 +93,16 @@ end;
 
 function StopInstalledLeadPilot(InstallDirectory: string): Boolean;
 var
-  StopScript, MetadataPath, DataDirectory, Parameters: string;
+  StopScript, MetadataPath, FrontendMetadataPath, DataDirectory, Parameters: string;
   ResultCode: Integer;
+  Attempt: Integer;
 begin
   StopScript := AddBackslash(InstallDirectory) + 'scripts\stop_leadpilot.ps1';
   DataDirectory := PersistentDataDirectory;
   MetadataPath := AddBackslash(DataDirectory) + 'runtime\backend.process.json';
+  FrontendMetadataPath := AddBackslash(DataDirectory) + 'runtime\frontend.process.json';
   if not FileExists(StopScript) then begin
-    Result := not FileExists(MetadataPath);
-    if not Result then
-      MsgBox('LeadPilot is running, but its shutdown helper is missing. Repair the installation before continuing.', mbError, MB_OK);
+    Result := (not FileExists(MetadataPath)) and (not FileExists(FrontendMetadataPath));
     exit;
   end;
 
@@ -110,10 +110,18 @@ begin
     '" -InstallRoot "' + InstallDirectory + '" -DataDirectory "' +
     DataDirectory + '" -StopFrontend';
   Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    Parameters, InstallDirectory, SW_HIDE, ewWaitUntilTerminated, ResultCode) and
-    (ResultCode = 0);
+    Parameters, InstallDirectory, SW_HIDE, ewNoWait, ResultCode);
   if not Result then
-    MsgBox('LeadPilot could not stop its owned processes. Close LeadPilot and try again. User data was not removed.', mbError, MB_OK);
+    exit;
+
+  for Attempt := 1 to 80 do begin
+    if (not FileExists(MetadataPath)) and (not FileExists(FrontendMetadataPath)) then begin
+      Result := True;
+      exit;
+    end;
+    Sleep(250);
+  end;
+  Result := False;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -153,6 +161,4 @@ end;
 function InitializeUninstall(): Boolean;
 begin
   Result := StopInstalledLeadPilot(ExpandConstant('{app}'));
-  if Result then
-    MsgBox('LeadPilot application files and shortcuts will be removed. Persistent data under %LOCALAPPDATA%\LeadPilot is preserved.', mbInformation, MB_OK);
 end;
