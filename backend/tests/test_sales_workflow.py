@@ -14,8 +14,8 @@ HEADERS = {"X-Local-Token": "test-token"}
 def test_sales_migration_is_versioned_and_repeatable(tmp_path: Path):
     database = Database(tmp_path / "sales.db")
 
-    assert database.initialize() == 5
-    assert database.initialize() == 5
+    assert database.initialize() == 6
+    assert database.initialize() == 6
     with database.session() as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         proposal_columns = {row[1] for row in connection.execute("PRAGMA table_info(proposals)")}
@@ -29,7 +29,7 @@ def test_sales_migration_is_versioned_and_repeatable(tmp_path: Path):
         "database_cost",
         "liability_cost",
     }.issubset(proposal_columns)
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
 
 
 def test_package_profit_includes_recurring_revenue_and_all_cost_fields():

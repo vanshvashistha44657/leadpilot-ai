@@ -256,12 +256,15 @@ Color statusColor(String status) {
     case 'active':
     case 'ready':
     case 'ok':
+    case 'connected':
       return AppColors.mint;
     case 'generated':
       return AppColors.blue;
     case 'edited':
       return AppColors.purple;
     case 'failed':
+    case 'error':
+    case 'unhealthy':
     case 'critical':
     case 'suppressed':
       return AppColors.red;

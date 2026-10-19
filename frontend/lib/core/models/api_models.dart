@@ -595,6 +595,28 @@ class GmailStatus {
   factory GmailStatus.fromJson(JsonMap json) => GmailStatus(configured: _bool(json['configured']), tokenAvailable: _bool(json['token_available']), senderEmailConfigured: _bool(json['sender_email_configured']), supportsLiveSend: _bool(json['supports_live_send']), reason: _string(json['reason']), senderEmail: json['sender_email']?.toString(), health: _string(json['health']));
 }
 
+class GmailSenderIdentity {
+  const GmailSenderIdentity({required this.emailAddress, this.messagesTotal, this.threadsTotal});
+
+  final String emailAddress;
+  final int? messagesTotal;
+  final int? threadsTotal;
+
+  factory GmailSenderIdentity.fromJson(JsonMap json) => GmailSenderIdentity(emailAddress: _string(json['email_address']), messagesTotal: json['messages_total'] == null ? null : _int(json['messages_total']), threadsTotal: json['threads_total'] == null ? null : _int(json['threads_total']));
+}
+
+class GmailHealth {
+  const GmailHealth({required this.status, required this.detail, this.senderIdentity});
+
+  final String status;
+  final String detail;
+  final GmailSenderIdentity? senderIdentity;
+
+  bool get isHealthy => status == 'healthy';
+
+  factory GmailHealth.fromJson(JsonMap json) => GmailHealth(status: _string(json['status']), detail: _string(json['detail']), senderIdentity: json['sender_identity'] is Map ? GmailSenderIdentity.fromJson(_map(json['sender_identity'])) : null);
+}
+
 class GmailAuthUrl {
   const GmailAuthUrl({required this.authorizationUrl, required this.state});
 
@@ -602,6 +624,59 @@ class GmailAuthUrl {
   final String state;
 
   factory GmailAuthUrl.fromJson(JsonMap json) => GmailAuthUrl(authorizationUrl: _string(json['authorization_url']), state: _string(json['state']));
+}
+
+class GmailReviewedDraft {
+  const GmailReviewedDraft({required this.localDraftId, required this.status, this.providerDraftId, this.providerThreadId});
+
+  final String localDraftId;
+  final String status;
+  final String? providerDraftId;
+  final String? providerThreadId;
+
+  bool get isCreated => status == 'created';
+
+  factory GmailReviewedDraft.fromJson(JsonMap json) => GmailReviewedDraft(localDraftId: _string(json['local_draft_id']), status: _string(json['status']), providerDraftId: json['provider_draft_id']?.toString(), providerThreadId: json['provider_thread_id']?.toString());
+}
+
+class GmailSyncResult {
+  const GmailSyncResult({required this.mode, required this.pages, required this.threadsSeen, this.threadsSkipped = 0, required this.threadsStored, required this.messagesSeen, required this.messagesStored, required this.matched, required this.unknown, required this.ambiguous, this.nextPageToken, this.historyId});
+
+  final String mode;
+  final int pages;
+  final int threadsSeen;
+  final int threadsSkipped;
+  final int threadsStored;
+  final int messagesSeen;
+  final int messagesStored;
+  final int matched;
+  final int unknown;
+  final int ambiguous;
+  final String? nextPageToken;
+  final String? historyId;
+
+  bool get isEmpty => threadsSeen == 0 && messagesSeen == 0;
+
+  factory GmailSyncResult.fromJson(JsonMap json) => GmailSyncResult(mode: _string(json['mode']), pages: _int(json['pages']), threadsSeen: _int(json['threads_seen']), threadsSkipped: _int(json['threads_skipped']), threadsStored: _int(json['threads_stored']), messagesSeen: _int(json['messages_seen']), messagesStored: _int(json['messages_stored']), matched: _int(json['matched']), unknown: _int(json['unknown']), ambiguous: _int(json['ambiguous']), nextPageToken: json['next_page_token']?.toString(), historyId: json['history_id']?.toString());
+}
+
+class GmailThread {
+  const GmailThread({required this.threadId, this.snippet, this.historyId});
+
+  final String threadId;
+  final String? snippet;
+  final String? historyId;
+
+  factory GmailThread.fromJson(JsonMap json) => GmailThread(threadId: _string(json['thread_id']), snippet: json['snippet']?.toString(), historyId: json['history_id']?.toString());
+}
+
+class GmailDisconnect {
+  const GmailDisconnect({required this.status, required this.providerRevoked});
+
+  final String status;
+  final bool providerRevoked;
+
+  factory GmailDisconnect.fromJson(JsonMap json) => GmailDisconnect(status: _string(json['status']), providerRevoked: _bool(json['provider_revoked']));
 }
 
 class WebsitePackage {

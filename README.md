@@ -47,7 +47,7 @@ packaging/windows/
 - Client and fulfillment records for projects, previews, deployments, domains, hosting/database plans, revisions, and renewals-ready status fields. URLs are recorded only; deployment is never claimed without a provider confirmation.
 - Deterministic client website brief/Lovable prompt generation without pretending that a Lovable project was created.
 - Configurable OpenAI-compatible LLM interface for personalization, reply classification, and brief generation; it remains unavailable until an environment-only provider key/model are configured, and records usage/cost metadata when called.
-- Gmail OAuth/API boundary using official Google endpoints, external token storage, sender/profile health checks, drafts, thread synchronization, and hard live-send gates. No live-capable state is claimed without OAuth, sender configuration, explicit approval, and a controlled integration-test marker.
+- Gmail Phase 3 uses the official Google endpoints for OAuth, reviewed draft creation, and permitted thread/message synchronization. It requests only `gmail.compose` and `gmail.readonly`; Gmail send endpoints are not called.
 - Deterministic website package recommendations, recurring revenue/profit calculations, proposal/payment/renewal tracking, and dry-run-only follow-up queueing with reply/bounce/unsubscribe exclusion.
 - Local authenticated API using `X-Local-Token`, JSON structured logging, SQLite WAL mode, migration tracking, and database backup endpoint.
 - Global automation stop/resume control that blocks new automation work and requests cancellation of queued/running jobs.
@@ -132,7 +132,7 @@ The app reads the API URL and local token from the process environment and keeps
 
 ## Provider configuration
 
-The mock provider is the only provider that is usable by default, and it never sends. Gmail now has an official OAuth/API boundary for authorization, token refresh, sender/profile health, drafts, sends, and thread synchronization, but live capability remains blocked until OAuth, sender configuration, `GMAIL_LIVE_SEND_APPROVED=true`, `GMAIL_LIVE_SEND_TESTED=true`, compliance gates, and a controlled integration test are complete. Microsoft Graph remains a non-live configuration stub. Do not treat environment-variable presence as proof of a working provider.
+The mock provider is the only provider that is usable by default, and it never sends. Gmail Phase 3 is draft-only: it never calls Gmail send endpoints. It uses the exact loopback redirect `http://127.0.0.1:8000/api/gmail/oauth/callback`, server-generated one-time state, and PKCE S256. The OAuth callback is browser-reachable without `X-Local-Token` only from localhost; every other route remains token-protected. Microsoft Graph remains a non-live configuration stub. Do not treat environment-variable presence as proof of a working provider.
 
 Before any live campaign, independently verify:
 
@@ -140,7 +140,7 @@ Before any live campaign, independently verify:
 2. Valid postal address and working unsubscribe destination.
 3. Lawful data provenance and suppression-list import.
 4. A real provider adapter test using a controlled mailbox and conservative limits.
-5. `DRY_RUN=false`, `LIVE_SENDING_ENABLED=true`, compliance acknowledgement, and an explicit operator approval process.
+5. `DRY_RUN=true` and `LIVE_SENDING_ENABLED=false` remain the Phase 3 backend defaults; this phase creates drafts only and does not send.
 
 Secrets belong in a local secret manager or environment configuration, never in chat, source code, `.env` files committed to version control, reports, or logs.
 
@@ -165,7 +165,9 @@ Secrets belong in a local secret manager or environment configuration, never in 
 - `GET /api/ai/status`, `GET /api/ai/config`, `GET /api/ai/usage`
 - `PATCH /api/ai/config` for non-secret provider settings and `POST /api/ai/connectivity` for a minimal structured provider check
 - `POST /api/ai/personalization/preview`, `POST /api/ai/reply-classification/preview`, `POST /api/ai/brief/preview`
-- `GET /api/gmail/status`, `GET /api/gmail/health`, `GET /api/gmail/auth-url`, `GET /api/gmail/oauth/callback`
+- `GET /api/gmail/status`, `GET /api/gmail/health`, `GET /api/gmail/auth-url`
+- `POST /api/gmail/drafts/reviewed` (and compatibility path `POST /api/gmail/drafts`) accepts only a local reviewed draft ID; `POST /api/drafts/{id}/gmail` is an equivalent explicit route. It creates a Gmail draft once, records safe provider IDs, and never sends or overwrites a provider draft.
+- `POST /api/gmail/sync` paginates permitted thread metadata/body retrieval, deduplicates provider message IDs, records exact lead matches or unknown/ambiguous outcomes, and uses an incremental history cursor with full-resync fallback when Gmail expires it. `POST /api/gmail/disconnect` revokes when possible and deletes local token material. The browser callback `GET /api/gmail/oauth/callback` is localhost-only and is the sole unauthenticated `/api` route.
 - `GET/POST /api/packages`, `POST /api/packages/recommend`, `POST /api/packages/{id}/profit`
 - `GET/POST/PATCH /api/proposals`, `/api/payments`, `/api/renewals`
 - `POST/GET /api/follow-ups/queue`, `/api/follow-ups`
@@ -248,13 +250,51 @@ with instructions not to invent company facts, achievements, prior
 interactions, or missing details. The structured subject/body response is
 validated and stored as a reviewable draft with provider/model/usage metadata.
 Drafts can be edited and regenerated; edited content is marked separately from
-the original generated subject/body. Phase 2 does not send, schedule, or create
-Gmail drafts. Suppressed, unsubscribed, replied, or bounced leads are blocked
-again immediately before generation and outreach preview.
+the original generated subject/body. Phase 2 does not send or schedule email.
+Phase 3 adds a separate, explicit reviewed-draft-to-Gmail-draft action; it never
+sends or overwrites a provider draft. Suppressed, unsubscribed, replied, or
+bounced leads are blocked again immediately before generation, Gmail draft
+creation, and outreach preview.
+
+### Phase 3 Gmail setup, scopes, and token storage
+
+Set the OAuth client ID/secret and sender identity in the backend process
+environment. Register exactly `http://127.0.0.1:8000/api/gmail/oauth/callback`
+with Google. `GET /api/gmail/auth-url` generates the state and PKCE verifier on
+the server; a caller-supplied `state` query value is ignored. Google receives
+the minimum Phase 3 scopes:
+
+```text
+https://www.googleapis.com/auth/gmail.compose
+https://www.googleapis.com/auth/gmail.readonly
+```
+
+`gmail.modify` is not requested. Offline access is used so the local backend can
+refresh an authorized session when needed. On Windows, access and refresh tokens
+are encrypted with the current user's DPAPI via stdlib `ctypes` and stored only
+in the per-user encrypted token file. The backend has no plaintext token-file
+fallback and fails closed if DPAPI is unavailable. Tokens are never stored in
+SQLite, ordinary settings, API models, logs, or audit details. Tests may inject
+an in-memory token store; production uses the DPAPI store.
+
+The OAuth callback is the only unauthenticated `/api` route. Middleware still
+requires it to arrive from localhost/loopback; all other API routes require
+`X-Local-Token`. Callback errors are deliberately generic. Disconnect attempts
+Google credential revocation and securely deletes local token material even when
+remote revocation is unavailable.
+
+The Settings screen exposes explicit Connect, Verify, and Disconnect controls;
+authorization alone is shown as pending until the profile health check succeeds.
+Draft review exposes **Create Gmail Draft** only for a known, eligible lead and
+nonempty generated/edited content. Thread synchronization is a separate manual
+action, bounded and paginated; it stores minimal message metadata/content for
+matching and deduplicates provider message IDs. Email bodies and headers are
+treated as untrusted input, attachments are not downloaded, and unknown or
+ambiguous lead matches are retained as such.
 
 ## Database and backup
 
-SQLite migrations are applied automatically on startup and tracked with `PRAGMA user_version` plus `schema_version` rows. The current schema is migration version 5 and includes leads, suppressions, campaigns, jobs, outreach events, audit logs, alerts, research fields, replies, clients, proposals, projects, payments, renewals, website packages, follow-up queue entries, AI usage events, import batches/errors/provenance, and reviewable personalized drafts. The backup endpoint uses SQLite's online backup API and writes to `backend/backups/` by default.
+SQLite migrations are applied automatically on startup and tracked with `PRAGMA user_version` plus `schema_version` rows. The current schema is migration version 6 and includes leads, suppressions, campaigns, jobs, outreach events, audit logs, alerts, research fields, replies, clients, proposals, projects, payments, renewals, website packages, follow-up queue entries, AI usage events, import batches/errors/provenance, reviewable personalized drafts, and Gmail account/draft-reference/sync/thread/message metadata. Migration 006 contains no token or client-secret columns. The backup endpoint uses SQLite's online backup API and writes to `backend/backups/` by default.
 
 The PostgreSQL/multi-device option is intentionally not enabled in this local release. The repository/service boundaries keep that migration possible without moving business rules into the UI.
 
@@ -382,7 +422,7 @@ The local queue is process-local with persisted job state. It is suitable for a 
 From `backend/`:
 
 ```text
-python -m pytest                 36 passed, 1 dependency deprecation warning
+python -m pytest                 72 passed, 1 dependency deprecation warning
 python -m compileall -q app tests passed
 ```
 

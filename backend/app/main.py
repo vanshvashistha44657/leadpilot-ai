@@ -33,6 +33,7 @@ from .repositories_sales import (
     RenewalRepository,
     SalesMetricsRepository,
 )
+from .repositories_gmail import GmailAccountRepository, GmailDraftReferenceRepository, GmailSyncRepository
 from .services.ai import AIService
 from .services.gmail import GmailService
 from .services.imports import LeadImportService
@@ -43,6 +44,8 @@ from .services.followups import FollowUpService
 from .services.providers import ProviderRegistry
 from .services.settings import SettingsService
 from .services.drafts import DraftService
+from .services.gmail_drafts import GmailDraftWorkflowService
+from .services.gmail_sync import GmailSyncService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -67,6 +70,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ai_usage = AIUsageRepository(database)
     drafts = DraftRepository(database)
     import_batches = ImportBatchRepository(database)
+    gmail_accounts = GmailAccountRepository(database)
+    gmail_draft_references = GmailDraftReferenceRepository(database)
+    gmail_sync = GmailSyncRepository(database)
     alerts = AlertRepository(database)
     audit = AuditRepository(database)
     gmail = GmailService()
@@ -105,6 +111,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         drafts=drafts,
         draft_service=DraftService(leads, drafts, ai, ai_usage),
         import_batches=import_batches,
+        gmail_accounts=gmail_accounts,
+        gmail_draft_references=gmail_draft_references,
+        gmail_sync=gmail_sync,
+        gmail_draft_workflow=GmailDraftWorkflowService(leads, drafts, gmail_draft_references, gmail),
+        gmail_sync_service=GmailSyncService(gmail, leads, gmail_sync, gmail_accounts),
     )
 
     @asynccontextmanager

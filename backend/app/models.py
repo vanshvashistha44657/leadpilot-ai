@@ -596,6 +596,44 @@ class GmailAuthUrl(BaseModel):
     state: str
 
 
+class GmailReviewedDraftRequest(BaseModel):
+    local_draft_id: str = Field(min_length=1, max_length=100)
+
+
+class GmailReviewedDraftOut(BaseModel):
+    local_draft_id: str
+    status: Literal["pending", "created", "failed"]
+    provider_draft_id: str | None = None
+    provider_thread_id: str | None = None
+
+
+class GmailSyncRequest(BaseModel):
+    query: str | None = Field(default=None, max_length=500)
+    page_token: str | None = Field(default=None, max_length=500)
+    max_results: int = Field(default=100, ge=1, le=500)
+    max_pages: int = Field(default=10, ge=1, le=100)
+
+
+class GmailSyncOut(BaseModel):
+    mode: Literal["full", "incremental", "full_resync"]
+    pages: int
+    threads_seen: int
+    threads_skipped: int = 0
+    threads_stored: int
+    messages_seen: int
+    messages_stored: int
+    matched: int
+    unknown: int
+    ambiguous: int
+    next_page_token: str | None = None
+    history_id: str | None = None
+
+
+class GmailDisconnectOut(BaseModel):
+    status: Literal["disconnected"] = "disconnected"
+    provider_revoked: bool
+
+
 class GmailSenderIdentity(BaseModel):
     email_address: str
     messages_total: int | None = None

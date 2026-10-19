@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
+from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -35,9 +36,12 @@ from ..models import (
     CampaignOut,
     DashboardMetrics,
     GmailAuthUrl,
-    GmailDraftOut,
-    GmailDraftRequest,
+    GmailDisconnectOut,
+    GmailReviewedDraftOut,
+    GmailReviewedDraftRequest,
     GmailHealth,
+    GmailSyncOut,
+    GmailSyncRequest,
     GmailThreadOut,
     GmailStatus,
     HealthResponse,
@@ -75,7 +79,14 @@ from ..services.research import score_verified_lead, score_factors
 from ..services.replies import classify_reply
 from ..services.ai import AIProviderError, AIUnavailableError
 from ..services.drafts import DraftRateLimitError, DraftSuppressedError
-from ..services.gmail import GmailApiError, GmailMessage, GmailUnavailableError
+from ..services.gmail import GmailApiError, GmailUnavailableError
+from ..services.gmail_drafts import (
+    ReviewedDraftError,
+    ReviewedDraftFailedError,
+    ReviewedDraftPendingError,
+    ReviewedDraftProviderError,
+    ReviewedDraftProviderUnavailableError,
+)
 from ..services.jobs import JobCancelled
 
 router = APIRouter()
@@ -641,16 +652,39 @@ def gmail_health(services: ServiceDep) -> GmailHealth:
     return services.gmail.health_check()
 
 
-@router.post("/api/gmail/drafts", response_model=GmailDraftOut, status_code=201, tags=["gmail"])
-def create_gmail_draft(payload: GmailDraftRequest, services: ServiceDep) -> GmailDraftOut:
+@router.post("/api/gmail/drafts/reviewed", response_model=GmailReviewedDraftOut, status_code=201, tags=["gmail"])
+@router.post("/api/gmail/drafts", response_model=GmailReviewedDraftOut, status_code=201, tags=["gmail"])
+def create_gmail_draft(payload: GmailReviewedDraftRequest, services: ServiceDep) -> GmailReviewedDraftOut:
     try:
-        draft = services.gmail.create_draft(GmailMessage(payload.recipient, payload.subject, payload.body, payload.thread_id))
-    except GmailUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=f"Gmail draft unavailable: {exc}") from exc
-    except GmailApiError as exc:
-        raise HTTPException(status_code=502, detail=f"Gmail draft provider error: {exc}") from exc
-    services.audit.record("gmail.draft_created", "local", {"draft_id": draft.draft_id, "thread_id": draft.thread_id})
-    return GmailDraftOut(draft_id=draft.draft_id, thread_id=draft.thread_id)
+        draft = services.gmail_draft_workflow.create_reviewed(payload.local_draft_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ReviewedDraftPendingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReviewedDraftFailedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReviewedDraftProviderUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ReviewedDraftProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ReviewedDraftError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    services.audit.record(
+        "gmail.draft_created",
+        "local",
+        {
+            "local_draft_id": draft["local_draft_id"],
+            "status": draft["status"],
+            "provider_draft_id": draft.get("provider_draft_id"),
+            "provider_thread_id": draft.get("provider_thread_id"),
+        },
+    )
+    return GmailReviewedDraftOut.model_validate(draft)
+
+
+@router.post("/api/drafts/{draft_id}/gmail", response_model=GmailReviewedDraftOut, status_code=201, tags=["gmail"])
+def create_reviewed_gmail_draft(draft_id: str, services: ServiceDep) -> GmailReviewedDraftOut:
+    return create_gmail_draft(GmailReviewedDraftRequest(local_draft_id=draft_id), services)
 
 
 @router.get("/api/gmail/threads", response_model=list[GmailThreadOut], tags=["gmail"])
@@ -663,33 +697,103 @@ def sync_gmail_threads(
     try:
         page = services.gmail.sync_threads(query=query, page_token=page_token, max_results=max_results)
     except GmailUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=f"Gmail thread sync unavailable: {exc}") from exc
+        raise HTTPException(status_code=503, detail="Gmail thread synchronization unavailable") from None
     except GmailApiError as exc:
-        raise HTTPException(status_code=502, detail=f"Gmail thread sync provider error: {exc}") from exc
+        raise HTTPException(status_code=502, detail="Gmail thread synchronization failed") from None
     return [GmailThreadOut(thread_id=item.thread_id, snippet=item.snippet, history_id=item.history_id) for item in page.threads]
 
 
-@router.get("/api/gmail/auth-url", response_model=GmailAuthUrl, tags=["gmail"])
-def gmail_auth_url(services: ServiceDep, state: str = Query(..., min_length=1, max_length=500)) -> GmailAuthUrl:
+@router.post("/api/gmail/sync", response_model=GmailSyncOut, tags=["gmail"])
+def synchronize_gmail(payload: GmailSyncRequest, services: ServiceDep) -> GmailSyncOut:
     try:
-        authorization_url = services.gmail.authorization_url(state)
+        result = services.gmail_sync_service.synchronize(**payload.model_dump())
+    except GmailUnavailableError:
+        services.gmail_sync.save_state(last_error="provider_unavailable")
+        services.audit.record("gmail.sync_failed", "local", {"category": "unavailable"})
+        raise HTTPException(status_code=503, detail="Gmail synchronization is unavailable") from None
+    except GmailApiError:
+        services.gmail_sync.save_state(last_error="provider_error")
+        services.audit.record("gmail.sync_failed", "local", {"category": "provider_error"})
+        raise HTTPException(status_code=502, detail="Gmail synchronization failed") from None
+    services.audit.record(
+        "gmail.sync_completed",
+        "local",
+        {
+            key: result[key]
+            for key in (
+                "mode",
+                "pages",
+                "threads_seen",
+                "threads_skipped",
+                "threads_stored",
+                "messages_seen",
+                "messages_stored",
+                "matched",
+                "unknown",
+                "ambiguous",
+            )
+            if key in result
+        },
+    )
+    return GmailSyncOut.model_validate(result)
+
+
+@router.get("/api/gmail/auth-url", response_model=GmailAuthUrl, tags=["gmail"])
+def gmail_auth_url(services: ServiceDep, state: str | None = Query(default=None, max_length=500)) -> GmailAuthUrl:
+    try:
+        # A legacy query value is deliberately ignored: OAuth state authority
+        # is always generated and retained by the server.
+        authorization_url = services.gmail.authorization_url()
     except GmailUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=f"Gmail OAuth unavailable: {exc}") from exc
-    return GmailAuthUrl(authorization_url=authorization_url, state=state)
+        raise HTTPException(status_code=503, detail="Gmail OAuth is unavailable") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="Gmail OAuth is unavailable") from None
+    parsed_state = parse_qs(urlparse(authorization_url).query).get("state", [""])[0]
+    return GmailAuthUrl(authorization_url=authorization_url, state=parsed_state)
 
 
 @router.get("/api/gmail/oauth/callback", response_model=GmailStatus, tags=["gmail"])
 def gmail_oauth_callback(
     services: ServiceDep,
-    code: str = Query(..., min_length=1, max_length=5000),
+    code: str | None = Query(default=None, min_length=1, max_length=5000),
     state: str = Query(..., min_length=1, max_length=500),
+    error: str | None = Query(default=None, max_length=200),
 ) -> GmailStatus:
+    if error is not None:
+        raise HTTPException(status_code=400, detail="Gmail authorization was denied")
+    if not code:
+        raise HTTPException(status_code=400, detail="Gmail OAuth callback is missing an authorization code")
     try:
-        return services.gmail.exchange_code(code, state)
-    except GmailUnavailableError as exc:
-        raise HTTPException(status_code=409, detail=f"Gmail OAuth callback rejected: {exc}") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        status = services.gmail.exchange_code(code, state)
+        health = services.gmail.health_check()
+        if health.sender_identity is not None:
+            status = status.model_copy(
+                update={
+                    "sender_email": health.sender_identity.email_address,
+                    "sender_email_configured": True,
+                    "health": health.status,
+                }
+            )
+        services.gmail_accounts.upsert(
+            email=health.sender_identity.email_address if health.sender_identity else status.sender_email,
+            scopes=("https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.readonly"),
+        )
+        return status
+    except (GmailUnavailableError, GmailApiError, ValueError):
+        # Do not reflect provider details, authorization codes, or state in a
+        # browser-visible error response.
+        raise HTTPException(status_code=400, detail="Gmail OAuth callback failed") from None
+
+
+@router.post("/api/gmail/disconnect", response_model=GmailDisconnectOut, tags=["gmail"])
+def disconnect_gmail(services: ServiceDep) -> GmailDisconnectOut:
+    try:
+        revoked = services.gmail.disconnect()
+    except (GmailUnavailableError, GmailApiError):
+        revoked = False
+    services.gmail_accounts.disconnect()
+    services.audit.record("gmail.disconnected", "local", {"provider_revoked": revoked})
+    return GmailDisconnectOut(provider_revoked=revoked)
 
 
 @router.post("/api/briefs/generate", response_model=BriefResponse, tags=["fulfillment"])

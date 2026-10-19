@@ -286,7 +286,26 @@ class ApiService {
 
   Future<GmailStatus> getGmailStatus() async => GmailStatus.fromJson(_object(await _send('GET', '/api/gmail/status')));
 
-  Future<GmailAuthUrl> getGmailAuthUrl(String state) async => GmailAuthUrl.fromJson(_object(await _send('GET', '/api/gmail/auth-url', query: {'state': state})));
+  Future<GmailHealth> getGmailHealth() async => GmailHealth.fromJson(_object(await _send('GET', '/api/gmail/health')));
+
+  Future<GmailAuthUrl> getGmailAuthUrl([String? state]) async => GmailAuthUrl.fromJson(_object(await _send('GET', '/api/gmail/auth-url', query: state == null || state.trim().isEmpty ? null : {'state': state.trim()})));
+
+  Future<GmailReviewedDraft> createGmailDraft(String localDraftId) async => GmailReviewedDraft.fromJson(_object(await _send('POST', '/api/gmail/drafts/reviewed', body: {'local_draft_id': localDraftId})));
+
+  Future<GmailSyncResult> syncGmailThreads({String? query, String? pageToken, int maxResults = 100, int maxPages = 1}) async => GmailSyncResult.fromJson(_object(await _send('POST', '/api/gmail/sync', body: {
+        if (query != null && query.trim().isNotEmpty) 'query': query.trim(),
+        if (pageToken != null && pageToken.trim().isNotEmpty) 'page_token': pageToken.trim(),
+        'max_results': maxResults,
+        'max_pages': maxPages,
+      })));
+
+  Future<List<GmailThread>> listGmailThreads({String? query, String? pageToken, int maxResults = 100}) async => _objects(await _send('GET', '/api/gmail/threads', query: {
+        if (query != null && query.trim().isNotEmpty) 'query': query.trim(),
+        if (pageToken != null && pageToken.trim().isNotEmpty) 'page_token': pageToken.trim(),
+        'max_results': '$maxResults',
+      })).map(GmailThread.fromJson).toList();
+
+  Future<GmailDisconnect> disconnectGmail() async => GmailDisconnect.fromJson(_object(await _send('POST', '/api/gmail/disconnect')));
 
   Future<List<WebsitePackage>> listPackages({bool includeInactive = false}) async => _objects(await _send('GET', '/api/packages', query: {'include_inactive': '$includeInactive'})).map(WebsitePackage.fromJson).toList();
 

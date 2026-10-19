@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ..models import ProviderStatus
-from .gmail import GmailApiAdapter, GmailLiveSendBlocked, GmailMessage, GmailService
+from .gmail import GmailService
 
 
 @dataclass(slots=True)
@@ -54,14 +54,7 @@ class GmailProvider:
         return self.service.status()
 
     def send(self, message: EmailMessage) -> ProviderSendResult:
-        adapter: GmailApiAdapter = self.service.adapter()
-        try:
-            provider_message_id = adapter.send_message(
-                GmailMessage(recipient=message.recipient, subject=message.subject, body=message.body)
-            )
-        except GmailLiveSendBlocked as exc:
-            raise RuntimeError(str(exc)) from exc
-        return ProviderSendResult(provider_message_id=provider_message_id, dry_run=False)
+        raise RuntimeError("Gmail sending is disabled in Phase 3; create a reviewed Gmail draft instead")
 
 
 class GraphProvider:

@@ -643,6 +643,11 @@ class DraftRepository:
             row = connection.execute("SELECT * FROM outreach_drafts WHERE lead_id = ?", (lead_id,)).fetchone()
         return dict(row) if row else None
 
+    def get(self, draft_id: str) -> dict[str, Any] | None:
+        with self.database.session() as connection:
+            row = connection.execute("SELECT * FROM outreach_drafts WHERE id = ?", (draft_id,)).fetchone()
+        return dict(row) if row else None
+
 
     def list(self, status: str | None = None, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         with self.database.session() as connection:

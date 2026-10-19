@@ -28,6 +28,7 @@ from .repositories_sales import (
     RenewalRepository,
     SalesMetricsRepository,
 )
+from .repositories_gmail import GmailAccountRepository, GmailDraftReferenceRepository, GmailSyncRepository
 from .services.ai import AIService
 from .services.gmail import GmailService
 from .services.imports import LeadImportService
@@ -38,6 +39,8 @@ from .services.followups import FollowUpService
 from .services.providers import ProviderRegistry
 from .services.settings import SettingsService
 from .services.drafts import DraftService
+from .services.gmail_drafts import GmailDraftWorkflowService
+from .services.gmail_sync import GmailSyncService
 
 
 @dataclass(slots=True)
@@ -71,6 +74,11 @@ class Services:
     drafts: DraftRepository
     draft_service: DraftService
     import_batches: ImportBatchRepository
+    gmail_accounts: GmailAccountRepository
+    gmail_draft_references: GmailDraftReferenceRepository
+    gmail_sync: GmailSyncRepository
+    gmail_draft_workflow: GmailDraftWorkflowService
+    gmail_sync_service: GmailSyncService
 
 
 def get_services(request: Request) -> Services:

@@ -195,7 +195,7 @@ def test_import_endpoints_reject_upload_limit(client):
     assert queued.status_code == 413
 
 
-def test_provider_credentials_do_not_enable_unimplemented_live_send(client, monkeypatch):
+def test_provider_credentials_do_not_enable_unimplemented_live_send_or_bypass_secure_storage(client, monkeypatch):
     for key, value in {
         "GMAIL_CLIENT_ID": "id",
         "GMAIL_CLIENT_SECRET": "secret",
@@ -204,7 +204,9 @@ def test_provider_credentials_do_not_enable_unimplemented_live_send(client, monk
     }.items():
         monkeypatch.setenv(key, value)
     providers = {item["name"]: item for item in client.get("/api/providers", headers=auth_headers()).json()}
-    assert providers["gmail"]["configured"] is True
+    # Phase 3 no longer accepts an environment refresh token as a credential
+    # store. Production OAuth tokens must be present in the OS-backed store.
+    assert providers["gmail"]["configured"] is False
     assert providers["gmail"]["supports_live_send"] is False
     assert client.get("/api/settings", headers=auth_headers()).json()["live_send_ready"] is False
 

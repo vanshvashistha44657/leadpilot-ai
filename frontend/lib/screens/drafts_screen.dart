@@ -17,6 +17,8 @@ class DraftsScreen extends StatefulWidget {
 class _DraftsScreenState extends State<DraftsScreen> {
   late Future<_DraftQueueData> _data;
   bool _busy = false;
+  bool _gmailConnected = false;
+  final Map<String, GmailReviewedDraft> _gmailDrafts = {};
 
   @override
   void initState() {
@@ -25,14 +27,30 @@ class _DraftsScreenState extends State<DraftsScreen> {
   }
 
   Future<_DraftQueueData> _loadData() async {
-    final results = await Future.wait([
-      widget.api.listDrafts(),
-      widget.api.listLeads(),
-    ]);
-    final drafts = results[0] as List<PersonalizedDraft>;
-    final leads = results[1] as List<Lead>;
+    final drafts = await widget.api.listDrafts();
+    final leads = await widget.api.listLeads();
+    GmailStatus? gmailStatus;
+    GmailHealth? gmailHealth;
+    String? gmailError;
+    try {
+      gmailStatus = await widget.api.getGmailStatus();
+      if (gmailStatus.configured) {
+        try {
+          gmailHealth = await widget.api.getGmailHealth();
+        } catch (_) {
+          gmailError = 'Gmail verification is unavailable.';
+        }
+      }
+    } catch (_) {
+      gmailError = 'Gmail connection status is unavailable.';
+    }
     return _DraftQueueData(
-        drafts: drafts, leadsById: {for (final lead in leads) lead.id: lead});
+      drafts: drafts,
+      leadsById: {for (final lead in leads) lead.id: lead},
+      gmailStatus: gmailStatus,
+      gmailHealth: gmailHealth,
+      gmailError: gmailError,
+    );
   }
 
   void _refresh() => setState(() => _data = _loadData());
@@ -78,6 +96,52 @@ class _DraftsScreenState extends State<DraftsScreen> {
     }
   }
 
+  Future<void> _createGmailDraft(PersonalizedDraft draft, Lead? lead) async {
+    if (!_canCreateGmailDraft(draft, lead)) return;
+    setState(() => _busy = true);
+    try {
+      final alreadyHadResult = _gmailDrafts.containsKey(draft.id);
+      final result = await widget.api.createGmailDraft(draft.id);
+      if (!mounted) return;
+      setState(() => _gmailDrafts[draft.id] = result);
+      if (alreadyHadResult) {
+        _showMessage('Gmail draft already exists. No duplicate was created.');
+      } else {
+        _showMessage('Gmail draft created. It is a draft and was not sent.');
+      }
+    } catch (error) {
+      if (!mounted) return;
+      if (error is ApiException && error.statusCode == 409) {
+        _showMessage(
+            'Gmail draft creation is already pending or was already handled. The review queue was kept.');
+      } else {
+        _showMessage('Gmail draft creation failed. The review queue was kept.');
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  bool _canCreateGmailDraft(PersonalizedDraft draft, Lead? lead) {
+    final status = draft.status.toLowerCase();
+    final leadStatus = lead?.status.toLowerCase();
+    return _dataReadyForGmail &&
+        (status == 'generated' || status == 'edited') &&
+        lead != null &&
+        lead.email.trim().isNotEmpty &&
+        draft.subject.trim().isNotEmpty &&
+        draft.body.trim().isNotEmpty &&
+        leadStatus != 'suppressed' &&
+        leadStatus != 'unsubscribed' &&
+        leadStatus != 'replied' &&
+        leadStatus != 'bounced' &&
+        !_gmailDrafts.containsKey(draft.id);
+  }
+
+  bool get _dataReadyForGmail {
+    return _gmailConnected;
+  }
+
   void _showMessage(String message) => ScaffoldMessenger.of(context)
     ..hideCurrentSnackBar()
     ..showSnackBar(SnackBar(content: Text(message)));
@@ -118,11 +182,14 @@ class _DraftsScreenState extends State<DraftsScreen> {
                     message: 'The backend returned no draft data.',
                     onRetry: _refresh);
               }
+              _gmailConnected = data.gmailConnected;
               return _DraftQueue(
                 data: data,
                 busy: _busy,
+                gmailDrafts: _gmailDrafts,
                 onEdit: _editDraft,
                 onRegenerate: _regenerateDraft,
+                onCreateGmailDraft: _createGmailDraft,
               );
             },
           ),
@@ -131,23 +198,38 @@ class _DraftsScreenState extends State<DraftsScreen> {
 }
 
 class _DraftQueueData {
-  const _DraftQueueData({required this.drafts, required this.leadsById});
+  const _DraftQueueData(
+      {required this.drafts,
+      required this.leadsById,
+      this.gmailStatus,
+      this.gmailHealth,
+      this.gmailError});
 
   final List<PersonalizedDraft> drafts;
   final Map<int, Lead> leadsById;
+  final GmailStatus? gmailStatus;
+  final GmailHealth? gmailHealth;
+  final String? gmailError;
+
+  bool get gmailConnected =>
+      gmailStatus?.configured == true && gmailHealth?.isHealthy == true;
 }
 
 class _DraftQueue extends StatelessWidget {
   const _DraftQueue(
       {required this.data,
       required this.busy,
+      required this.gmailDrafts,
       required this.onEdit,
-      required this.onRegenerate});
+      required this.onRegenerate,
+      required this.onCreateGmailDraft});
 
   final _DraftQueueData data;
   final bool busy;
+  final Map<String, GmailReviewedDraft> gmailDrafts;
   final ValueChanged<PersonalizedDraft> onEdit;
   final ValueChanged<PersonalizedDraft> onRegenerate;
+  final void Function(PersonalizedDraft draft, Lead? lead) onCreateGmailDraft;
 
   @override
   Widget build(BuildContext context) {
@@ -172,6 +254,8 @@ class _DraftQueue extends StatelessWidget {
                   subtitle:
                       'Generated content stays editable until you are satisfied with the review.',
                 ),
+                const SizedBox(height: 14),
+                _GmailDraftReadiness(data: data),
                 if (counts.isNotEmpty) ...[
                   const SizedBox(height: 16),
                   Wrap(
@@ -205,8 +289,11 @@ class _DraftQueue extends StatelessWidget {
                       draft: data.drafts[index],
                       lead: data.leadsById[data.drafts[index].leadId],
                       busy: busy,
+                      gmailConnected: data.gmailConnected,
+                      gmailDraft: gmailDrafts[data.drafts[index].id],
                       onEdit: onEdit,
                       onRegenerate: onRegenerate,
+                      onCreateGmailDraft: onCreateGmailDraft,
                     ),
                     if (index < data.drafts.length - 1)
                       const SizedBox(height: 12),
@@ -220,19 +307,59 @@ class _DraftQueue extends StatelessWidget {
   }
 }
 
+class _GmailDraftReadiness extends StatelessWidget {
+  const _GmailDraftReadiness({required this.data});
+
+  final _DraftQueueData data;
+
+  @override
+  Widget build(BuildContext context) {
+    if (data.gmailError != null) {
+      return const SafetyBanner(
+        title: 'Gmail verification unavailable',
+        message:
+            'Verify Gmail in Settings before creating a Gmail draft. Local review remains available.',
+        safe: false,
+      );
+    }
+    if (!data.gmailConnected) {
+      return const SafetyBanner(
+        title: 'Gmail is not verified',
+        message:
+            'Create Gmail Draft stays disabled until Gmail is connected and its health check succeeds.',
+        safe: false,
+      );
+    }
+    final account = data.gmailHealth?.senderIdentity?.emailAddress ??
+        data.gmailStatus?.senderEmail;
+    return SafetyBanner(
+      title: 'Gmail verified · draft-only',
+      message: account == null || account.isEmpty
+          ? 'Reviewed drafts can be copied to Gmail as drafts. Nothing is sent.'
+          : 'Account $account is verified. Reviewed drafts create Gmail drafts only; nothing is sent.',
+    );
+  }
+}
+
 class _DraftQueueItem extends StatelessWidget {
   const _DraftQueueItem(
       {required this.draft,
       required this.lead,
       required this.busy,
+      required this.gmailConnected,
+      required this.gmailDraft,
       required this.onEdit,
-      required this.onRegenerate});
+      required this.onRegenerate,
+      required this.onCreateGmailDraft});
 
   final PersonalizedDraft draft;
   final Lead? lead;
   final bool busy;
+  final bool gmailConnected;
+  final GmailReviewedDraft? gmailDraft;
   final ValueChanged<PersonalizedDraft> onEdit;
   final ValueChanged<PersonalizedDraft> onRegenerate;
+  final void Function(PersonalizedDraft draft, Lead? lead) onCreateGmailDraft;
 
   String get _leadName {
     if (lead == null) return 'Lead #${draft.leadId}';
@@ -250,6 +377,43 @@ class _DraftQueueItem extends StatelessWidget {
     }
     if (lead!.title?.trim().isNotEmpty == true) parts.add(lead!.title!);
     return parts.join(' · ');
+  }
+
+  bool get _eligible {
+    final leadStatus = lead?.status.toLowerCase();
+    final draftStatus = draft.status.toLowerCase();
+    return gmailConnected &&
+        gmailDraft == null &&
+        (draftStatus == 'generated' || draftStatus == 'edited') &&
+        lead != null &&
+        lead!.email.trim().isNotEmpty &&
+        draft.subject.trim().isNotEmpty &&
+        draft.body.trim().isNotEmpty &&
+        leadStatus != 'suppressed' &&
+        leadStatus != 'unsubscribed' &&
+        leadStatus != 'replied' &&
+        leadStatus != 'bounced';
+  }
+
+  String get _gmailActionHint {
+    if (gmailDraft != null) {
+      return 'Already created in Gmail. This is a draft and was not sent.';
+    }
+    if (!gmailConnected) return 'Verify Gmail in Settings first.';
+    if (lead == null || lead!.email.trim().isEmpty) {
+      return 'A known lead email is required.';
+    }
+    if (draft.status != 'generated' && draft.status != 'edited') {
+      return 'Only a reviewed generated or edited draft can be created.';
+    }
+    if (draft.subject.trim().isEmpty || draft.body.trim().isEmpty) {
+      return 'Add a nonempty subject and body before creating the Gmail draft.';
+    }
+    if (['suppressed', 'unsubscribed', 'replied', 'bounced']
+        .contains(lead!.status.toLowerCase())) {
+      return 'This lead is blocked from outreach.';
+    }
+    return 'Create a Gmail draft only. No send action is available.';
   }
 
   @override
@@ -321,6 +485,50 @@ class _DraftQueueItem extends StatelessWidget {
                           color: AppColors.slate, fontSize: 12)),
               ],
             ),
+            const SizedBox(height: 10),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                onPressed: busy || !_eligible
+                    ? null
+                    : () => onCreateGmailDraft(draft, lead),
+                icon: busy && _eligible
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.mark_email_unread_outlined, size: 18),
+                label: Text(gmailDraft == null
+                    ? 'Create Gmail Draft'
+                    : 'Gmail draft created'),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(_gmailActionHint,
+                style: const TextStyle(color: AppColors.slate, fontSize: 12)),
+            if (gmailDraft != null) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                    color: AppColors.mintSoft,
+                    borderRadius: BorderRadius.circular(10)),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Gmail draft · not sent',
+                          style: TextStyle(
+                              fontWeight: FontWeight.w800,
+                              color: AppColors.mint)),
+                      if (gmailDraft!.providerDraftId?.isNotEmpty == true)
+                        Text('Draft ID: ${gmailDraft!.providerDraftId}',
+                            style: const TextStyle(fontSize: 12)),
+                      if (gmailDraft!.providerThreadId?.isNotEmpty == true)
+                        Text('Thread ID: ${gmailDraft!.providerThreadId}',
+                            style: const TextStyle(fontSize: 12)),
+                    ]),
+              ),
+            ],
           ],
         ),
       );

@@ -325,7 +325,7 @@ def test_gmail_authorization_url_uses_official_endpoint_and_no_network():
 
 def test_gmail_oauth_exchange_stores_tokens_without_exposing_token_result():
     store = MemoryTokenStore()
-    transport = FakeTransport([response({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600, "scope": "gmail.modify"})])
+    transport = FakeTransport([response({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600, "scope": "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"})])
     adapter = GmailApiAdapter(gmail_config(), transport=transport, token_store=store)
 
     result = adapter.exchange_code("authorization-code")
