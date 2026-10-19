@@ -249,6 +249,125 @@ function Get-TrackedFrontend {
   }
 }
 
+function Get-FrontendProcessState {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string]$ExpectedExecutable,
+    [string]$Label
+  )
+
+  $state = [ordered]@{
+    label = $Label
+    pid = if ($null -ne $Process) { $Process.Id } else { $null }
+    exists = $false
+    has_exited = $null
+    executable = ""
+    start_time_utc = ""
+    session_id = $null
+    main_window_handle = "0x0"
+    main_window_title = ""
+    exit_time_utc = ""
+    exit_observed_at_utc = ""
+    path_matches = $false
+  }
+  if ($null -eq $Process) {
+    Write-ProgressLog (("FRONTEND STATE {0}: {1}" -f $Label, ($state | ConvertTo-Json -Compress)))
+    return [pscustomobject]$state
+  }
+  try {
+    $Process.Refresh()
+    $state.exists = $true
+    $state.has_exited = $Process.HasExited
+    $state.session_id = $Process.SessionId
+    if (-not $Process.HasExited) {
+      $state.executable = [IO.Path]::GetFullPath($Process.Path)
+      $state.start_time_utc = $Process.StartTime.ToUniversalTime().ToString("o")
+      $state.main_window_handle = "0x{0:X}" -f $Process.MainWindowHandle.ToInt64()
+      $state.main_window_title = $Process.MainWindowTitle
+      $state.path_matches = [StringComparer]::OrdinalIgnoreCase.Equals($state.executable, $ExpectedExecutable)
+    } else {
+      $state["exit_observed_at_utc"] = (Get-Date).ToUniversalTime().ToString("o")
+      try { $state["exit_time_utc"] = $Process.ExitTime.ToUniversalTime().ToString("o") } catch { }
+    }
+  } catch {
+    $state.error = $_.Exception.Message
+  }
+  Write-ProgressLog (("FRONTEND STATE {0}: {1}" -f $Label, ($state | ConvertTo-Json -Compress)))
+  return [pscustomobject]$state
+}
+
+function Test-ExactFrontendProcess {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string]$ExpectedExecutable,
+    [DateTimeOffset]$RecordedStart
+  )
+
+  if ($null -eq $Process) { return $false }
+  try {
+    $Process.Refresh()
+    if ($Process.HasExited) { return $false }
+    $actualPath = [IO.Path]::GetFullPath($Process.Path)
+    $actualStart = [DateTimeOffset]$Process.StartTime.ToUniversalTime()
+    return [StringComparer]::OrdinalIgnoreCase.Equals($actualPath, $ExpectedExecutable) -and
+      [Math]::Abs(($actualStart - $RecordedStart).TotalSeconds) -le 15
+  } catch {
+    return $false
+  }
+}
+
+function Wait-ExactFrontendExit {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string]$ExpectedExecutable,
+    [DateTimeOffset]$RecordedStart,
+    [int]$TimeoutSeconds,
+    [string]$OperationName
+  )
+
+  $deadline = (Get-Date).ToUniversalTime().AddSeconds($TimeoutSeconds)
+  while ((Get-Date).ToUniversalTime() -lt $deadline) {
+    $current = Get-Process -Id $Process.Id -ErrorAction SilentlyContinue
+    if ($null -eq $current) {
+      try {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+          Get-FrontendProcessState $Process $ExpectedExecutable $OperationName | Out-Null
+          return $true
+        }
+      } catch { }
+      Write-ProgressLog "FRONTEND STATE ${OperationName}: pid=$($Process.Id) exists=False exit_time_unavailable=process-not-found"
+      return $true
+    }
+    $state = Get-FrontendProcessState $current $ExpectedExecutable $OperationName
+    if ($state.has_exited) {
+      return $true
+    }
+    if (-not (Test-ExactFrontendProcess $current $ExpectedExecutable $RecordedStart)) {
+      throw "Tracked frontend process identity changed while waiting for shutdown."
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  return $false
+}
+
+function Stop-ExactFrontendProcess {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string]$ExpectedExecutable,
+    [DateTimeOffset]$RecordedStart
+  )
+
+  if (-not (Test-ExactFrontendProcess $Process $ExpectedExecutable $RecordedStart)) {
+    throw "Refusing to force-stop the frontend because its PID, executable path, or start time no longer matches the owned process."
+  }
+  Write-ProgressLog "FRONTEND SHUTDOWN METHOD=force-stop pid=$($Process.Id) after graceful timeout"
+  Stop-Process -Id $Process.Id -Force
+  if (-not (Wait-ExactFrontendExit $Process $ExpectedExecutable $RecordedStart 5 "frontend forced shutdown wait")) {
+    throw "Owned frontend process did not exit after the ownership-validated forced stop."
+  }
+}
+
 function Assert-LauncherShortcut {
   param([string]$ShortcutPath)
 
@@ -280,10 +399,15 @@ function Invoke-FrontendSmoke {
   param([string]$InstallDirectory, [string]$DataDirectory, [int]$CheckPort)
 
   $launcher = Join-Path $InstallDirectory "scripts\run_leadpilot.ps1"
-  $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '" -InstallRoot "' + $InstallDirectory + '" -DataDirectory "' + $DataDirectory + '" -Port ' + $CheckPort + ' -FrontendTimeoutSeconds 120 -LaunchFrontend'
-  Write-ProgressLog "START frontend smoke on port $CheckPort"
-  $launcherProcess = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -PassThru
-  $script:ActiveLauncherProcess = $launcherProcess
+  $eventName = "Local\LeadPilot-Smoke-$([Guid]::NewGuid().ToString('N'))"
+  $shutdownEvent = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $eventName)
+  try {
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '" -InstallRoot "' + $InstallDirectory + '" -DataDirectory "' + $DataDirectory + '" -Port ' + $CheckPort + ' -FrontendTimeoutSeconds 120 -FrontendShutdownEventName "' + $eventName + '" -LaunchFrontend'
+    Write-ProgressLog "START frontend smoke on port $CheckPort"
+    Write-ProgressLog "FRONTEND SHUTDOWN EVENT name=$eventName"
+    $launcherProcess = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -PassThru
+    $script:ActiveLauncherProcess = $launcherProcess
+    $script:ActiveLauncherStart = [DateTimeOffset]$launcherProcess.StartTime.ToUniversalTime()
   $script:ActiveInstallDirectory = $InstallDirectory
   $script:ActiveDataDirectory = $DataDirectory
   $frontend = $null
@@ -297,33 +421,76 @@ function Invoke-FrontendSmoke {
     $exitCode = if ($launcherProcess.HasExited) { $launcherProcess.ExitCode } else { "running" }
     throw "Installed launcher did not publish its owned packaged Flutter frontend (launcher state: $exitCode)."
   }
-  $script:ActiveFrontendProcess = $frontend
+    $script:ActiveFrontendProcess = $frontend
 
-  Write-ProgressLog "FRONTEND STARTED pid=$($frontend.Id) on port $CheckPort; requesting graceful shutdown"
-  Start-Sleep -Seconds 3
-  $closeRequested = $frontend.CloseMainWindow()
-  Write-ProgressLog "FRONTEND CLOSE REQUESTED pid=$($frontend.Id) result=$closeRequested"
-  $graceful = $frontend.WaitForExit(10000)
-  Write-ProgressLog "FRONTEND WAIT COMPLETE pid=$($frontend.Id) graceful=$graceful"
-  if (-not $graceful -and -not $frontend.HasExited) {
-    Stop-Process -Id $frontend.Id -Force
-    $null = $frontend.WaitForExit(5000)
+    $expectedExecutable = [IO.Path]::GetFullPath((Join-Path $InstallDirectory "LeadPilot\leadpilot_frontend.exe"))
+    $metadataPath = Join-Path $DataDirectory "runtime\frontend.process.json"
+    $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+    $recordedStart = [DateTimeOffset]::Parse([string]$metadata.started_at_utc)
+    Get-FrontendProcessState $frontend $expectedExecutable "before graceful close" | Out-Null
+    $identityValid = Test-ExactFrontendProcess $frontend $expectedExecutable $recordedStart
+    Write-ProgressLog "FRONTEND IDENTITY pid=$($frontend.Id) path=$expectedExecutable recorded_start=$recordedStart valid=$identityValid"
+    Write-ProgressLog "FRONTEND STARTED pid=$($frontend.Id) on port $CheckPort; requesting graceful shutdown"
+    Start-Sleep -Seconds 3
+    $frontend.Refresh()
+    $mainWindowHandle = $frontend.MainWindowHandle
+    $windowAvailable = $mainWindowHandle -ne [IntPtr]::Zero
+    Write-ProgressLog "FRONTEND WINDOW available=$windowAvailable handle=$(('0x{0:X}' -f $mainWindowHandle.ToInt64())) title=[$($frontend.MainWindowTitle)] session=$($frontend.SessionId)"
+    $closeRequested = $false
+    if ($windowAvailable -and (Test-ExactFrontendProcess $frontend $expectedExecutable $recordedStart)) {
+      $closeRequested = $frontend.CloseMainWindow()
+      Write-ProgressLog "FRONTEND CLOSE REQUESTED pid=$($frontend.Id) method=CloseMainWindow result=$closeRequested"
+    } else {
+      Write-ProgressLog "FRONTEND CLOSE REQUESTED pid=$($frontend.Id) method=CloseMainWindow skipped=no-usable-window-or-identity-mismatch"
+    }
+    $graceful = Wait-ExactFrontendExit $frontend $expectedExecutable $recordedStart 10 "frontend graceful close wait"
+    if ($graceful) {
+      Write-ProgressLog "FRONTEND WAIT COMPLETE pid=$($frontend.Id) graceful=True method=CloseMainWindow-or-already-exited"
+    } else {
+      Write-ProgressLog "FRONTEND WAIT COMPLETE pid=$($frontend.Id) graceful=False method=CloseMainWindow result=$closeRequested"
+      if (-not (Test-ExactFrontendProcess $frontend $expectedExecutable $recordedStart)) {
+        throw "Tracked frontend process identity changed before deterministic smoke shutdown."
+      }
+      $frontend.Refresh()
+      $retryWindowHandle = $frontend.MainWindowHandle
+      $retryWindowAvailable = $retryWindowHandle -ne [IntPtr]::Zero
+      Write-ProgressLog "FRONTEND WINDOW RETRY available=$retryWindowAvailable handle=$(('0x{0:X}' -f $retryWindowHandle.ToInt64())) title=[$($frontend.MainWindowTitle)] session=$($frontend.SessionId)"
+      if ($retryWindowAvailable) {
+        $retryCloseRequested = $frontend.CloseMainWindow()
+        Write-ProgressLog "FRONTEND CLOSE REQUESTED pid=$($frontend.Id) method=CloseMainWindow-retry result=$retryCloseRequested"
+        $graceful = Wait-ExactFrontendExit $frontend $expectedExecutable $recordedStart 10 "frontend graceful close retry wait"
+        if ($graceful) {
+          Write-ProgressLog "FRONTEND WAIT COMPLETE pid=$($frontend.Id) graceful=True method=CloseMainWindow-retry"
+        }
+      }
+      if (-not $graceful) {
+        Write-ProgressLog "FRONTEND SHUTDOWN REQUEST method=test-event pid=$($frontend.Id)"
+        if (-not $shutdownEvent.Set()) {
+          throw "Could not signal the frontend's test shutdown event."
+        }
+        $graceful = Wait-ExactFrontendExit $frontend $expectedExecutable $recordedStart 10 "frontend test-event shutdown wait"
+        if ($graceful) {
+          Write-ProgressLog "FRONTEND WAIT COMPLETE pid=$($frontend.Id) graceful=True method=test-event"
+        } else {
+          Stop-ExactFrontendProcess $frontend $expectedExecutable $recordedStart
+        }
+      }
+    }
+    Write-ProgressLog "START launcher wait pid=$($launcherProcess.Id)"
+    $launcherExited = $launcherProcess.WaitForExit(15000)
+    Write-ProgressLog "END launcher wait pid=$($launcherProcess.Id) exited=$launcherExited"
+    if (-not $launcherProcess.HasExited) {
+      throw "Installed launcher did not exit after its owned frontend process closed."
+    }
+    if ($launcherProcess.ExitCode -ne 0) {
+      throw "Installed launcher exited with code $($launcherProcess.ExitCode) after its owned frontend process closed."
+    }
+    $script:ActiveFrontendProcess = $null
+    $script:ActiveLauncherProcess = $null
+    Write-ProgressLog "END frontend smoke on port $CheckPort"
+  } finally {
+    $shutdownEvent.Dispose()
   }
-  Write-ProgressLog "START launcher wait pid=$($launcherProcess.Id)"
-  $launcherExited = $launcherProcess.WaitForExit(15000)
-  Write-ProgressLog "END launcher wait pid=$($launcherProcess.Id) exited=$launcherExited"
-  if (-not $graceful) {
-    throw "Owned packaged Flutter frontend did not exit gracefully after CloseMainWindow returned $closeRequested."
-  }
-  if (-not $launcherProcess.HasExited) {
-    throw "Installed launcher did not exit after its owned frontend process closed."
-  }
-  if ($launcherProcess.ExitCode -ne 0) {
-    throw "Installed launcher exited with code $($launcherProcess.ExitCode) after its owned frontend process closed."
-  }
-  $script:ActiveFrontendProcess = $null
-  $script:ActiveLauncherProcess = $null
-  Write-ProgressLog "END frontend smoke on port $CheckPort"
 }
 
 function Invoke-BackendOnlyStart {
@@ -352,20 +519,73 @@ function Assert-NoPackageSecrets {
 function Stop-TestOwnedFrontend {
   param(
     [System.Diagnostics.Process]$Process,
-    [string]$InstallDirectory
+    [string]$InstallDirectory,
+    [string]$DataDirectory
   )
 
-  if ($null -eq $Process -or $Process.HasExited) { return }
+  if ($null -eq $Process) { return }
   $expected = [IO.Path]::GetFullPath((Join-Path $InstallDirectory "LeadPilot\leadpilot_frontend.exe"))
   try {
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($Process.Path), $expected)) {
+    $metadataPath = Join-Path $DataDirectory "runtime\frontend.process.json"
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { return }
+    $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+    if ([int]$metadata.pid -ne $Process.Id) { return }
+    $recordedStart = [DateTimeOffset]::Parse([string]$metadata.started_at_utc)
+    if (-not (Test-ExactFrontendProcess $Process $expected $recordedStart)) {
       return
     }
-    $null = $Process.CloseMainWindow()
-    $null = $Process.WaitForExit(5000)
-    if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
-    $null = $Process.WaitForExit(5000)
+    $Process.Refresh()
+    $windowAvailable = $Process.MainWindowHandle -ne [IntPtr]::Zero
+    Write-ProgressLog "CLEANUP frontend window available=$windowAvailable pid=$($Process.Id)"
+    if ($windowAvailable) {
+      $closeRequested = $Process.CloseMainWindow()
+      Write-ProgressLog "CLEANUP frontend CloseMainWindow result=$closeRequested pid=$($Process.Id)"
+    }
+    if (-not (Wait-ExactFrontendExit $Process $expected $recordedStart 5 "cleanup frontend graceful close wait")) {
+      Stop-ExactFrontendProcess $Process $expected $recordedStart
+    }
   } catch { }
+}
+
+function Test-ExactLauncherProcess {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string]$InstallDirectory,
+    [DateTimeOffset]$RecordedStart
+  )
+
+  if ($null -eq $Process) { return $false }
+  try {
+    $Process.Refresh()
+    if ($Process.HasExited) { return $false }
+    $actualStart = [DateTimeOffset]$Process.StartTime.ToUniversalTime()
+    if ([Math]::Abs(($actualStart - $RecordedStart).TotalSeconds) -gt 15) { return $false }
+    $path = [IO.Path]::GetFullPath($Process.Path)
+    if (-not $path.EndsWith("\powershell.exe", [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($Process.Id)" -ErrorAction SilentlyContinue
+    return $null -ne $cim -and
+      ([string]$cim.CommandLine).IndexOf("run_leadpilot.ps1", [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+      ([string]$cim.CommandLine).IndexOf($InstallDirectory, [StringComparison]::OrdinalIgnoreCase) -ge 0
+  } catch {
+    return $false
+  }
+}
+
+function Stop-TestOwnedLauncher {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [string]$InstallDirectory,
+    [DateTimeOffset]$RecordedStart
+  )
+
+  if ($null -eq $Process) { return }
+  if (-not (Test-ExactLauncherProcess $Process $InstallDirectory $RecordedStart)) {
+    Write-ProgressLog "CLEANUP left launcher running because its ownership checks failed pid=$($Process.Id)"
+    return
+  }
+  Write-ProgressLog "CLEANUP stopping owned launcher pid=$($Process.Id)"
+  Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+  try { $null = $Process.WaitForExit(5000) } catch { }
 }
 
 function Stop-TestOwnedBackendFromMetadata {
@@ -401,7 +621,7 @@ function Invoke-TestOwnedCleanup {
 
   $frontend = $script:ActiveFrontendProcess
   if ($null -eq $frontend) { $frontend = Get-TrackedFrontend $InstallDirectory $DataDirectory }
-  Stop-TestOwnedFrontend $frontend $InstallDirectory
+  Stop-TestOwnedFrontend $frontend $InstallDirectory $DataDirectory
 
   $stopScript = Join-Path $InstallDirectory "scripts\stop_leadpilot.ps1"
   if (Test-Path -LiteralPath $stopScript -PathType Leaf) {
@@ -417,7 +637,7 @@ function Invoke-TestOwnedCleanup {
   if ($null -ne $launcher -and -not $launcher.HasExited) {
     try { $null = $launcher.WaitForExit(5000) } catch { }
     if (-not $launcher.HasExited) {
-      Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
+      Stop-TestOwnedLauncher $launcher $InstallDirectory $script:ActiveLauncherStart
       try { $null = $launcher.WaitForExit(5000) } catch { }
     }
   }
@@ -441,6 +661,7 @@ $oldLocalAppData = $env:LOCALAPPDATA
 $oldDataOverride = $env:LEADPILOT_DATA_DIRECTORY
 $script:ActiveFrontendProcess = $null
 $script:ActiveLauncherProcess = $null
+$script:ActiveLauncherStart = $null
 $script:InstallerInvocation = 1
 $script:UserData = $userData
 $script:ProcessLogDirectory = Join-Path $testRoot "process-logs"

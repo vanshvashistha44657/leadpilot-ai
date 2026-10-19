@@ -7,7 +7,8 @@ param(
   [switch]$LaunchFlutter,
   [switch]$VerifyOnly,
   [switch]$KeepBackend,
-  [int]$FrontendTimeoutSeconds = 0
+  [int]$FrontendTimeoutSeconds = 0,
+  [string]$FrontendShutdownEventName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -176,6 +177,24 @@ function Remove-FrontendMetadataIfOwned {
   }
 }
 
+function Stop-TestFrontendIfOwned {
+  param(
+    [System.Diagnostics.Process]$Process,
+    [object]$Metadata,
+    [string]$ExpectedExecutable
+  )
+
+  if ($null -eq $Process -or $Process.HasExited) { return }
+  if (-not (Test-TrackedProcess $Process $Metadata $ExpectedExecutable)) {
+    throw "Refusing to force-stop a frontend process that failed its ownership checks."
+  }
+  Stop-Process -Id $Process.Id -Force
+  try { $null = $Process.WaitForExit(5000) } catch { }
+  if (-not $Process.HasExited) {
+    throw "LeadPilot frontend PID $($Process.Id) did not exit after the bounded test stop."
+  }
+}
+
 function Invoke-ApiCheck {
   param(
     [string]$Uri,
@@ -190,6 +209,10 @@ if ($LaunchFlutter -and $LaunchFrontend) {
 }
 if ($VerifyOnly -and ($LaunchFlutter -or $LaunchFrontend)) {
   throw "-VerifyOnly cannot be combined with a frontend launch option."
+}
+if (-not [string]::IsNullOrWhiteSpace($FrontendShutdownEventName) -and
+    $FrontendShutdownEventName -notmatch '^Local\\LeadPilot-Smoke-[0-9a-fA-F]+$') {
+  throw "-FrontendShutdownEventName must be a verifier-created local smoke-test event."
 }
 
 $root = if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
@@ -344,18 +367,23 @@ try {
   if ($LaunchFrontend) {
     $env:LEADPILOT_API_URL = "http://127.0.0.1:$Port"
     $env:LEADPILOT_LOCAL_TOKEN = $LocalToken
-    $frontendProcess = Start-Process -FilePath $frontendExecutable -WorkingDirectory (Split-Path -Parent $frontendExecutable) -PassThru
+    $frontendArguments = @()
+    if (-not [string]::IsNullOrWhiteSpace($FrontendShutdownEventName)) {
+      $frontendArguments += "--leadpilot-test-shutdown-event=$FrontendShutdownEventName"
+    }
+    $frontendProcess = Start-Process -FilePath $frontendExecutable -ArgumentList $frontendArguments -WorkingDirectory (Split-Path -Parent $frontendExecutable) -PassThru
+    $frontendExecutablePath = [IO.Path]::GetFullPath($frontendExecutable)
     $frontendMetadata = [ordered]@{
       pid = $frontendProcess.Id
-      executable = [IO.Path]::GetFullPath($frontendExecutable)
+      executable = $frontendExecutablePath
       started_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+      session_id = $frontendProcess.SessionId
     }
     $frontendMetadata | ConvertTo-Json | Set-Content -LiteralPath $frontendMetadataPath -Encoding ascii
     try {
       if ($FrontendTimeoutSeconds -gt 0) {
         if (-not $frontendProcess.WaitForExit($FrontendTimeoutSeconds * 1000)) {
-          Stop-Process -Id $frontendProcess.Id -Force -ErrorAction SilentlyContinue
-          try { $null = $frontendProcess.WaitForExit(5000) } catch { }
+          Stop-TestFrontendIfOwned $frontendProcess $frontendMetadata $frontendExecutablePath
           throw "LeadPilot frontend exceeded its ${FrontendTimeoutSeconds}-second test timeout."
         }
       } else {
