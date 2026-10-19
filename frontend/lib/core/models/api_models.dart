@@ -68,13 +68,15 @@ class Lead {
 }
 
 class ImportResult {
-  const ImportResult({required this.imported, required this.duplicates, required this.suppressed, required this.invalid, required this.processed, this.errors = const []});
+  const ImportResult({required this.imported, required this.duplicates, required this.suppressed, required this.invalid, required this.processed, this.skipped = 0, this.batchId, this.errors = const []});
 
   final int imported;
   final int duplicates;
   final int suppressed;
   final int invalid;
   final int processed;
+  final int skipped;
+  final String? batchId;
   final List<String> errors;
 
   factory ImportResult.fromJson(JsonMap json) => ImportResult(
@@ -83,8 +85,46 @@ class ImportResult {
         suppressed: _int(json['suppressed']),
         invalid: _int(json['invalid']),
         processed: _int(json['processed']),
+        skipped: _int(json['skipped']),
+        batchId: json['batch_id']?.toString(),
         errors: (json['errors'] as List? ?? const []).map((value) => value.toString()).toList(),
       );
+}
+
+class ImportPreview {
+  const ImportPreview({required this.filename, required this.fileType, required this.columns, required this.suggestedMapping, required this.sampleRows, required this.rowCount, required this.limitExceeded, this.errors = const []});
+
+  final String filename;
+  final String fileType;
+  final List<String> columns;
+  final JsonMap suggestedMapping;
+  final List<JsonMap> sampleRows;
+  final int rowCount;
+  final bool limitExceeded;
+  final List<String> errors;
+
+  factory ImportPreview.fromJson(JsonMap json) => ImportPreview(filename: _string(json['filename']), fileType: _string(json['file_type']), columns: (json['columns'] as List? ?? const []).map((item) => item.toString()).toList(), suggestedMapping: _map(json['suggested_mapping']), sampleRows: (json['sample_rows'] as List? ?? const []).map((item) => _map(item)).toList(), rowCount: _int(json['row_count']), limitExceeded: _bool(json['limit_exceeded']), errors: (json['errors'] as List? ?? const []).map((item) => item.toString()).toList());
+}
+
+class PersonalizedDraft {
+  const PersonalizedDraft({required this.id, required this.leadId, required this.status, required this.provider, required this.model, required this.subject, required this.body, required this.generatedSubject, required this.generatedBody, required this.offer, required this.tone, required this.callToAction, this.error, this.updatedAt});
+
+  final String id;
+  final int leadId;
+  final String status;
+  final String provider;
+  final String model;
+  final String subject;
+  final String body;
+  final String generatedSubject;
+  final String generatedBody;
+  final String offer;
+  final String tone;
+  final String callToAction;
+  final String? error;
+  final DateTime? updatedAt;
+
+  factory PersonalizedDraft.fromJson(JsonMap json) => PersonalizedDraft(id: _string(json['id']), leadId: _int(json['lead_id']), status: _string(json['status']), provider: _string(json['provider']), model: _string(json['model']), subject: _string(json['subject']), body: _string(json['body']), generatedSubject: _string(json['generated_subject']), generatedBody: _string(json['generated_body']), offer: _string(json['offer']), tone: _string(json['tone']), callToAction: _string(json['call_to_action']), error: json['error']?.toString(), updatedAt: _date(json['updated_at']));
 }
 
 class Suppression {
@@ -482,16 +522,35 @@ class AIProviderStatus {
 }
 
 class AIProviderConfig {
-  const AIProviderConfig({required this.provider, required this.timeoutSeconds, required this.maxRetries, required this.apiKeyConfigured, this.model, this.baseUrl});
+  const AIProviderConfig({required this.provider, required this.timeoutSeconds, required this.maxRetries, required this.retryBackoffSeconds, required this.apiKeyConfigured, this.model, this.baseUrl, this.configurationErrors = const []});
 
   final String provider;
   final String? model;
   final String? baseUrl;
   final double timeoutSeconds;
   final int maxRetries;
+  final double retryBackoffSeconds;
   final bool apiKeyConfigured;
+  final List<String> configurationErrors;
 
-  factory AIProviderConfig.fromJson(JsonMap json) => AIProviderConfig(provider: _string(json['provider']), model: json['model']?.toString(), baseUrl: json['base_url']?.toString(), timeoutSeconds: _double(json['timeout_seconds']), maxRetries: _int(json['max_retries']), apiKeyConfigured: _bool(json['api_key_configured']));
+  factory AIProviderConfig.fromJson(JsonMap json) => AIProviderConfig(provider: _string(json['provider']), model: json['model']?.toString(), baseUrl: json['base_url']?.toString(), timeoutSeconds: _double(json['timeout_seconds']), maxRetries: _int(json['max_retries']), retryBackoffSeconds: _double(json['retry_backoff_seconds']), apiKeyConfigured: _bool(json['api_key_configured']), configurationErrors: (json['configuration_errors'] as List? ?? const []).map((item) => item.toString()).toList());
+}
+
+class AIConnectivityResult {
+  const AIConnectivityResult({required this.status, required this.provider, required this.detail, required this.checkedAt, this.model, this.totalTokens, this.estimatedCostUsd});
+
+  final String status;
+  final String provider;
+  final String? model;
+  final String detail;
+  final DateTime checkedAt;
+  final int? totalTokens;
+  final double? estimatedCostUsd;
+
+  factory AIConnectivityResult.fromJson(JsonMap json) {
+    final usage = json['usage'] is Map ? Map<String, dynamic>.from(json['usage'] as Map) : const <String, dynamic>{};
+    return AIConnectivityResult(status: _string(json['status']), provider: _string(json['provider']), model: json['model']?.toString(), detail: _string(json['detail']), checkedAt: _date(json['checked_at']) ?? DateTime.now(), totalTokens: usage['total_tokens'] == null ? null : _int(usage['total_tokens']), estimatedCostUsd: usage['estimated_cost_usd'] == null ? null : _double(usage['estimated_cost_usd']));
+  }
 }
 
 class AIUsageSummary {

@@ -43,7 +43,7 @@ class OutreachService:
             raise LookupError("campaign not found")
         items = []
         for lead in self.leads.list(request.lead_ids):
-            if lead["status"] in {"suppressed", "unsubscribed", "replied", "bounced"}:
+            if lead["status"] in {"suppressed", "unsubscribed", "replied", "bounced"} or not self.leads.is_outreach_eligible(lead["id"]):
                 continue
             items.append(
                 OutreachPreviewItem(
@@ -67,7 +67,7 @@ class OutreachService:
             # Dry-runs deliberately use the deterministic mock provider. A configured
             # real adapter is never contacted by a preview or ordinary campaign run.
             provider = self.providers.get("mock")
-        leads = [lead for lead in self.leads.list(request.lead_ids) if lead["status"] not in {"suppressed", "unsubscribed", "replied", "bounced"}]
+        leads = [lead for lead in self.leads.list(request.lead_ids) if self.leads.is_outreach_eligible(lead["id"])]
         self.campaigns.set_status(campaign_id, "running")
         sent = 0
         failed = 0

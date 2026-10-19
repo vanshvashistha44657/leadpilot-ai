@@ -23,6 +23,7 @@ def _json_load(value: str | None, default: Any) -> Any:
 def _lead(row: Any) -> dict[str, Any]:
     result = dict(row)
     result["metadata"] = _json_load(result.pop("metadata_json", None), {})
+    result["score_factors"] = _json_load(result.pop("score_factors_json", None), {})
     return result
 
 
@@ -88,6 +89,19 @@ class LeadRepository:
                     ),
                 )
                 inserted += cursor.rowcount
+                if cursor.rowcount and lead.get("import_batch_id"):
+                    connection.execute(
+                        """INSERT OR IGNORE INTO lead_import_sources
+                           (lead_id, batch_id, source_row, source_label, imported_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            cursor.lastrowid,
+                            lead["import_batch_id"],
+                            lead["source_row"],
+                            lead.get("source_label"),
+                            now,
+                        ),
+                    )
         return inserted
 
     def get(self, lead_id: int) -> dict[str, Any] | None:
@@ -124,12 +138,16 @@ class LeadRepository:
         status: str,
         website_url: str | None,
         notes: str | None,
+        score_version: str = "v1",
+        score_factors: dict[str, Any] | None = None,
+        research_source: str | None = None,
     ) -> dict[str, Any] | None:
         with self.database.session() as connection:
             connection.execute(
                 """UPDATE leads SET opportunity_score = ?, research_status = ?, website_url = ?,
-                   research_notes = ?, updated_at = ? WHERE id = ?""",
-                (score, status, website_url, notes, utc_now(), lead_id),
+                   research_notes = ?, score_version = ?, score_factors_json = ?,
+                   research_source = ?, research_verified_at = ?, updated_at = ? WHERE id = ?""",
+                (score, status, website_url, notes, score_version, json.dumps(score_factors or {}, separators=(",", ":")), research_source, utc_now(), utc_now(), lead_id),
             )
             row = connection.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
         return _lead(row) if row else None
@@ -241,6 +259,21 @@ class LeadRepository:
     def count_status(self, status: str) -> int:
         with self.database.session() as connection:
             return int(connection.execute("SELECT COUNT(*) FROM leads WHERE status = ?", (status,)).fetchone()[0])
+
+    def is_outreach_eligible(self, lead_id: int) -> bool:
+        with self.database.session() as connection:
+            row = connection.execute(
+                """SELECT l.status FROM leads AS l
+                   WHERE l.id = ?
+                     AND l.status NOT IN ('suppressed', 'unsubscribed', 'replied', 'bounced')
+                     AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.normalized_email = l.normalized_email)""",
+                (lead_id,),
+            ).fetchone()
+        return row is not None
+
+    def count_recent_draft_generations(self, since: str) -> int:
+        with self.database.session() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM outreach_drafts WHERE generated_at >= ?", (since,)).fetchone()[0])
 
 
 class ReplyRepository:
@@ -599,6 +632,218 @@ class SettingsRepository:
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                     (key, value, now),
                 )
+
+
+class DraftRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    def get_for_lead(self, lead_id: int) -> dict[str, Any] | None:
+        with self.database.session() as connection:
+            row = connection.execute("SELECT * FROM outreach_drafts WHERE lead_id = ?", (lead_id,)).fetchone()
+        return dict(row) if row else None
+
+
+    def list(self, status: str | None = None, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        with self.database.session() as connection:
+            if status:
+                rows = connection.execute("SELECT * FROM outreach_drafts WHERE status = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?", (status, limit, offset)).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM outreach_drafts ORDER BY updated_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_recent_draft_generations(self, since: str) -> int:
+        with self.database.session() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM outreach_drafts WHERE generated_at >= ?", (since,)).fetchone()[0])
+
+    def upsert_generated(self, values: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        with self.database.session() as connection:
+            connection.execute(
+                """INSERT INTO outreach_drafts
+                   (id, lead_id, status, provider, model, subject, body, generated_subject, generated_body,
+                    offer, tone, call_to_action, request_id, prompt_tokens, completion_tokens, total_tokens,
+                    estimated_cost_usd, error, generated_at, updated_at)
+                   VALUES (?, ?, 'generated', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                   ON CONFLICT(lead_id) DO UPDATE SET
+                     status = 'generated', provider = excluded.provider, model = excluded.model,
+                     subject = excluded.subject, body = excluded.body,
+                     generated_subject = excluded.generated_subject, generated_body = excluded.generated_body,
+                     offer = excluded.offer, tone = excluded.tone, call_to_action = excluded.call_to_action,
+                     request_id = excluded.request_id, prompt_tokens = excluded.prompt_tokens,
+                     completion_tokens = excluded.completion_tokens, total_tokens = excluded.total_tokens,
+                     estimated_cost_usd = excluded.estimated_cost_usd, error = NULL,
+                     generated_at = excluded.generated_at, updated_at = excluded.updated_at""",
+                (values["id"], values["lead_id"], values["provider"], values["model"], values["subject"], values["body"], values["subject"], values["body"], values["offer"], values["tone"], values["call_to_action"], values.get("request_id"), values.get("prompt_tokens"), values.get("completion_tokens"), values.get("total_tokens"), values.get("estimated_cost_usd"), now, now),
+            )
+            row = connection.execute("SELECT * FROM outreach_drafts WHERE lead_id = ?", (values["lead_id"],)).fetchone()
+        return dict(row)
+
+    def upsert_failed(self, values: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        with self.database.session() as connection:
+            connection.execute(
+                """INSERT INTO outreach_drafts
+                   (id, lead_id, status, provider, model, subject, body, generated_subject, generated_body,
+                    offer, tone, call_to_action, request_id, prompt_tokens, completion_tokens, total_tokens,
+                    estimated_cost_usd, error, generated_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(lead_id) DO UPDATE SET
+                     status = 'failed', provider = excluded.provider, model = excluded.model,
+                     subject = excluded.subject, body = excluded.body,
+                     generated_subject = excluded.generated_subject, generated_body = excluded.generated_body,
+                     offer = excluded.offer, tone = excluded.tone, call_to_action = excluded.call_to_action,
+                     request_id = excluded.request_id, prompt_tokens = excluded.prompt_tokens,
+                     completion_tokens = excluded.completion_tokens, total_tokens = excluded.total_tokens,
+                     estimated_cost_usd = excluded.estimated_cost_usd, error = excluded.error,
+                     generated_at = excluded.generated_at, updated_at = excluded.updated_at""",
+                (
+                    values["id"],
+                    values["lead_id"],
+                    "failed",
+                    values["provider"],
+                    values["model"],
+                    values["subject"],
+                    values["body"],
+                    values["generated_subject"],
+                    values["generated_body"],
+                    values["offer"],
+                    values["tone"],
+                    values["call_to_action"],
+                    values.get("request_id"),
+                    values.get("prompt_tokens"),
+                    values.get("completion_tokens"),
+                    values.get("total_tokens"),
+                    values.get("estimated_cost_usd"),
+                    values["error"],
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM outreach_drafts WHERE lead_id = ?", (values["lead_id"],)).fetchone()
+        return dict(row)
+
+    def update_content(self, draft_id: str, subject: str, body: str) -> dict[str, Any] | None:
+        with self.database.session() as connection:
+            connection.execute("UPDATE outreach_drafts SET subject = ?, body = ?, status = 'edited', updated_at = ? WHERE id = ?", (subject, body, utc_now(), draft_id))
+            row = connection.execute("SELECT * FROM outreach_drafts WHERE id = ?", (draft_id,)).fetchone()
+        return dict(row) if row else None
+
+
+class ImportBatchRepository:
+    def __init__(self, database: Database):
+        self.database = database
+
+    def create(self, batch_id: str, filename: str, file_type: str) -> None:
+        with self.database.session() as connection:
+            connection.execute("INSERT INTO import_batches(id, filename, file_type, status, created_at) VALUES (?, ?, ?, 'running', ?)", (batch_id, filename, file_type, utc_now()))
+
+    def complete(
+        self,
+        batch_id: str,
+        result: dict[str, Any],
+        error: str | None = None,
+        error_details: list[dict[str, Any]] | None = None,
+    ) -> None:
+        details = error_details
+        if details is None:
+            details = getattr(result, "error_details", None) or result.get("error_details", [])
+        if not details and result.get("errors"):
+            details = [
+                {
+                    "row_number": 0,
+                    "field_name": None,
+                    "error_code": "import_error",
+                    "message": str(message),
+                }
+                for message in result["errors"]
+            ]
+        if not details and error:
+            details = [
+                {
+                    "row_number": 0,
+                    "field_name": None,
+                    "error_code": "import_error",
+                    "message": error,
+                }
+            ]
+        details = [self._normalize_error_detail(detail) for detail in details]
+        with self.database.session() as connection:
+            connection.execute(
+                """UPDATE import_batches SET status = ?, rows_processed = ?, imported_count = ?, duplicate_count = ?,
+                   suppressed_count = ?, invalid_count = ?, skipped_count = ?, error_count = ?, finished_at = ?, error = ?
+                   WHERE id = ?""",
+                (
+                    "failed" if error else "completed",
+                    result.get("processed", 0),
+                    result.get("imported", 0),
+                    result.get("duplicates", 0),
+                    result.get("suppressed", 0),
+                    result.get("invalid", 0),
+                    result.get("skipped", 0),
+                    len(details),
+                    utc_now(),
+                    error,
+                    batch_id,
+                ),
+            )
+            for detail in details:
+                connection.execute(
+                    """INSERT INTO import_errors
+                       (batch_id, row_number, field_name, error_code, message, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        batch_id,
+                        detail["row_number"],
+                        detail["field_name"],
+                        detail["error_code"],
+                        detail["message"],
+                        utc_now(),
+                    ),
+                )
+
+    def fail(
+        self,
+        batch_id: str,
+        error: str,
+        *,
+        error_code: str = "import_error",
+        result: dict[str, Any] | None = None,
+        error_details: list[dict[str, Any]] | None = None,
+    ) -> None:
+        details = error_details or [
+            {
+                "row_number": 0,
+                "field_name": None,
+                "error_code": error_code,
+                "message": error,
+            }
+        ]
+        self.complete(batch_id, result or {}, error=error, error_details=details)
+
+    def list_errors(self, batch_id: str) -> list[dict[str, Any]]:
+        with self.database.session() as connection:
+            rows = connection.execute(
+                "SELECT * FROM import_errors WHERE batch_id = ? ORDER BY id", (batch_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_sources(self, batch_id: str) -> list[dict[str, Any]]:
+        with self.database.session() as connection:
+            rows = connection.execute(
+                "SELECT * FROM lead_import_sources WHERE batch_id = ? ORDER BY source_row, lead_id",
+                (batch_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "row_number": int(detail.get("row_number", 0)),
+            "field_name": detail.get("field_name"),
+            "error_code": str(detail.get("error_code") or "import_error"),
+            "message": str(detail.get("message") or "import error"),
+        }
 
 
 class AlertRepository:

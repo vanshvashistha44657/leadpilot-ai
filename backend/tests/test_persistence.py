@@ -8,9 +8,9 @@ from app.repositories import LeadRepository
 
 def test_versioned_migration_and_lead_persistence(tmp_path: Path):
     database = Database(tmp_path / "leadpilot.db")
-    assert database.initialize() == 4
+    assert database.initialize() == 5
     with database.session() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"schema_version", "leads", "jobs", "audit_logs", "website_packages", "follow_up_queue", "ai_usage_events"}.issubset(tables)
 
@@ -37,7 +37,7 @@ def test_interrupted_additive_migration_is_recoverable(tmp_path: Path):
     finally:
         connection.close()
 
-    assert database.initialize() == 4
+    assert database.initialize() == 5
     with database.session() as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(leads)").fetchall()}
     assert {"opportunity_score", "research_status", "website_url", "research_notes"}.issubset(columns)

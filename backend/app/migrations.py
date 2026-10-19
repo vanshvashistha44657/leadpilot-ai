@@ -22,6 +22,8 @@ def apply_migrations(connection: sqlite3.Connection, migrations_directory: Path 
         connection.executescript(path.read_text(encoding="utf-8"))
         if version == 3:
             _ensure_sales_workflow_columns(connection)
+        if version == 5:
+            _ensure_phase2_lead_columns(connection)
         connection.execute(f"PRAGMA user_version = {version}")
         connection.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, ?)",
@@ -64,3 +66,16 @@ def _ensure_sales_workflow_columns(connection: sqlite3.Connection) -> None:
         if name not in columns:
             connection.execute(f"ALTER TABLE proposals ADD COLUMN {name} {definition}")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_proposals_package ON proposals(package_id)")
+
+
+def _ensure_phase2_lead_columns(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(leads)").fetchall()}
+    additions = {
+        "score_version": "TEXT NOT NULL DEFAULT 'v1'",
+        "score_factors_json": "TEXT NOT NULL DEFAULT '{}'",
+        "research_source": "TEXT",
+        "research_verified_at": "TEXT",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE leads ADD COLUMN {name} {definition}")

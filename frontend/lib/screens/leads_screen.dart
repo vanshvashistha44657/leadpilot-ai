@@ -70,12 +70,35 @@ class _LeadsScreenState extends State<LeadsScreen> {
     }
     setState(() => _busy = true);
     try {
-      final job = await widget.api.queueImportLeads(path);
+      final preview = await widget.api.previewLeadImport(path);
+      if (!mounted) return;
+      final mapping = await showDialog<JsonMap>(context: context, builder: (context) => _ImportPreviewDialog(preview: preview));
+      if (mapping == null) return;
+      final job = await widget.api.queueImportLeads(path, mapping: mapping);
       if (!mounted) return;
       _showMessage('Import queued as ${job.id.substring(0, 8)}. Check the dashboard job activity for progress.');
       _csvPathController.clear();
       _refresh();
       _watchImport(job.id);
+    } catch (error) {
+      if (mounted) _showMessage(error.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _draftLead(Lead lead) async {
+    final values = await showDialog<JsonMap>(context: context, builder: (context) => const _DraftOptionsDialog());
+    if (values == null) return;
+    setState(() => _busy = true);
+    try {
+      final draft = await widget.api.generateDraft(leadId: lead.id, offer: values['offer'] as String, tone: values['tone'] as String, callToAction: values['call_to_action'] as String);
+      if (!mounted) return;
+      final edited = await showDialog<JsonMap>(context: context, builder: (context) => _DraftEditorDialog(draft: draft));
+      if (edited != null) {
+        await widget.api.updateDraft(draft.id, subject: edited['subject'] as String, body: edited['body'] as String);
+        if (mounted) _showMessage('Draft saved as user-edited. It was not sent.');
+      }
     } catch (error) {
       if (mounted) _showMessage(error.toString());
     } finally {
@@ -196,7 +219,7 @@ class _LeadsScreenState extends State<LeadsScreen> {
               if (snapshot.connectionState == ConnectionState.waiting) return const LoadingState(label: 'Loading leads…');
               if (snapshot.hasError) return ErrorState(message: snapshot.error.toString(), onRetry: _refresh);
               final data = snapshot.data ?? const _LeadPage([], 0);
-              return _LeadTable(leads: data.leads, total: data.total, page: _page, pageSize: _pageSize, searchController: _searchController, onReview: _reviewLead, onPageChanged: (page) => setState(() { _page = page; _leads = _loadPage(); }), onPageSizeChanged: (size) => setState(() { _pageSize = size; _page = 0; _leads = _loadPage(); }));
+               return _LeadTable(leads: data.leads, total: data.total, page: _page, pageSize: _pageSize, searchController: _searchController, onReview: _reviewLead, onDraft: _draftLead, onPageChanged: (page) => setState(() { _page = page; _leads = _loadPage(); }), onPageSizeChanged: (size) => setState(() { _pageSize = size; _page = 0; _leads = _loadPage(); }));
             },
           ),
         ],
@@ -211,7 +234,7 @@ class _LeadPage {
 }
 
 class _LeadTable extends StatelessWidget {
-  const _LeadTable({required this.leads, required this.total, required this.page, required this.pageSize, required this.searchController, required this.onReview, required this.onPageChanged, required this.onPageSizeChanged});
+  const _LeadTable({required this.leads, required this.total, required this.page, required this.pageSize, required this.searchController, required this.onReview, required this.onDraft, required this.onPageChanged, required this.onPageSizeChanged});
 
   final List<Lead> leads;
   final int total;
@@ -219,6 +242,7 @@ class _LeadTable extends StatelessWidget {
   final int pageSize;
   final TextEditingController searchController;
   final ValueChanged<Lead> onReview;
+  final ValueChanged<Lead> onDraft;
   final ValueChanged<int> onPageChanged;
   final ValueChanged<int> onPageSizeChanged;
 
@@ -257,6 +281,7 @@ class _LeadTable extends StatelessWidget {
                    DataColumn(label: Text('Status')),
                    DataColumn(label: Text('Opportunity')),
                    DataColumn(label: Text('Source')),
+                   DataColumn(label: Text('Draft')),
                 ],
                 rows: visible.map((lead) => DataRow(onSelectChanged: (_) => onReview(lead), cells: [
                       DataCell(Text('${lead.id}')),
@@ -266,6 +291,7 @@ class _LeadTable extends StatelessWidget {
                        DataCell(StatusPill(label: lead.status, color: statusColor(lead.status))),
                        DataCell(Text(lead.researchStatus == 'unresearched' ? '—' : '${lead.opportunityScore}/100')),
                        DataCell(Text(lead.source?.isNotEmpty == true ? lead.source! : '—')),
+                       DataCell(IconButton(tooltip: 'Generate draft', onPressed: lead.status == 'suppressed' || lead.status == 'unsubscribed' || lead.status == 'replied' || lead.status == 'bounced' ? null : () => onDraft(lead), icon: const Icon(Icons.auto_awesome_outlined))),
                     ])).toList(),
               ),
             ),
@@ -289,6 +315,79 @@ class _LeadTable extends StatelessWidget {
       ),
     );
   }
+}
+
+class _ImportPreviewDialog extends StatefulWidget {
+  const _ImportPreviewDialog({required this.preview});
+
+  final ImportPreview preview;
+
+  @override
+  State<_ImportPreviewDialog> createState() => _ImportPreviewDialogState();
+}
+
+class _ImportPreviewDialogState extends State<_ImportPreviewDialog> {
+  late final Map<String, String> _mapping = {for (final entry in widget.preview.suggestedMapping.entries) entry.key: entry.value};
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: Text('Preview ${widget.preview.filename}'),
+        content: SizedBox(
+          width: 760,
+          child: SingleChildScrollView(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('${widget.preview.rowCount} rows detected · ${widget.preview.columns.length} columns'),
+              const SizedBox(height: 12),
+              if (widget.preview.errors.isNotEmpty) Text(widget.preview.errors.join(' · '), style: const TextStyle(color: AppColors.red)),
+              const Text('Column mapping', style: TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 8),
+              ...widget.preview.columns.map((column) => Row(children: [Expanded(child: Text(column)), const SizedBox(width: 12), Expanded(child: DropdownButton<String>(isExpanded: true, value: _mapping[column] == null || const ['email', 'first_name', 'last_name', 'company', 'title', 'source'].contains(_mapping[column]) == false ? 'ignore' : _mapping[column], items: const [DropdownMenuItem(value: 'ignore', child: Text('Ignore')), DropdownMenuItem(value: 'email', child: Text('Email')), DropdownMenuItem(value: 'first_name', child: Text('First name')), DropdownMenuItem(value: 'last_name', child: Text('Last name')), DropdownMenuItem(value: 'company', child: Text('Company')), DropdownMenuItem(value: 'title', child: Text('Title')), DropdownMenuItem(value: 'source', child: Text('Source'))], onChanged: (value) => setState(() => _mapping[column] = value ?? 'ignore')))])),
+              const SizedBox(height: 12),
+              const Text('Sample rows are shown for mapping only; the backend revalidates the full upload.', style: TextStyle(color: AppColors.slate, fontSize: 12)),
+            ]),
+          ),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), ElevatedButton(onPressed: widget.preview.limitExceeded || widget.preview.errors.isNotEmpty ? null : () => Navigator.pop(context, {for (final entry in _mapping.entries) if (entry.value != 'ignore') entry.key: entry.value}), child: const Text('Queue import'))],
+      );
+}
+
+class _DraftOptionsDialog extends StatefulWidget {
+  const _DraftOptionsDialog();
+
+  @override
+  State<_DraftOptionsDialog> createState() => _DraftOptionsDialogState();
+}
+
+class _DraftOptionsDialogState extends State<_DraftOptionsDialog> {
+  final _offer = TextEditingController();
+  final _tone = TextEditingController(text: 'professional');
+  final _cta = TextEditingController(text: 'Reply if this is useful.');
+
+  @override
+  void dispose() { _offer.dispose(); _tone.dispose(); _cta.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(title: const Text('Draft outreach'), content: SizedBox(width: 500, child: Column(mainAxisSize: MainAxisSize.min, children: [TextField(controller: _offer, onChanged: (_) => setState(() {}), decoration: const InputDecoration(labelText: 'Offer / service brief *')), const SizedBox(height: 12), TextField(controller: _tone, decoration: const InputDecoration(labelText: 'Tone')), const SizedBox(height: 12), TextField(controller: _cta, onChanged: (_) => setState(() {}), decoration: const InputDecoration(labelText: 'Call to action *'))])), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), ElevatedButton(onPressed: _offer.text.trim().isEmpty || _cta.text.trim().isEmpty ? null : () => Navigator.pop(context, {'offer': _offer.text.trim(), 'tone': _tone.text.trim(), 'call_to_action': _cta.text.trim()}), child: const Text('Generate draft'))]);
+}
+
+class _DraftEditorDialog extends StatefulWidget {
+  const _DraftEditorDialog({required this.draft});
+
+  final PersonalizedDraft draft;
+
+  @override
+  State<_DraftEditorDialog> createState() => _DraftEditorDialogState();
+}
+
+class _DraftEditorDialogState extends State<_DraftEditorDialog> {
+  late final _subject = TextEditingController(text: widget.draft.subject);
+  late final _body = TextEditingController(text: widget.draft.body);
+
+  @override
+  void dispose() { _subject.dispose(); _body.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(title: const Text('Review personalized draft'), content: SizedBox(width: 600, child: Column(mainAxisSize: MainAxisSize.min, children: [const Text('AI-generated content is editable. This phase never sends or schedules email.', style: TextStyle(color: AppColors.slate)), const SizedBox(height: 12), TextField(controller: _subject, decoration: const InputDecoration(labelText: 'Subject')), const SizedBox(height: 12), TextField(controller: _body, minLines: 8, maxLines: 14, decoration: const InputDecoration(labelText: 'Body', alignLabelWithHint: true))])), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Discard')), ElevatedButton(onPressed: () => Navigator.pop(context, {'subject': _subject.text.trim(), 'body': _body.text.trim()}), child: const Text('Save edited draft'))]);
 }
 
 class _ResearchDialog extends StatefulWidget {

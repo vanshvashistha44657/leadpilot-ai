@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from app.models import AIPersonalizationRequest, BriefRequest
-from app.services.ai import AIConfig, AIProviderError, AIUnavailableError, HttpLLMProvider
+from app.services.ai import AIConfig, AIConnectivityError, AIProviderError, AIUnavailableError, HttpLLMProvider
 from app.services.gmail import (
     GmailApiAdapter,
     GmailConfig,
@@ -130,6 +130,83 @@ def test_ai_http_provider_retries_and_returns_structured_usage_metadata():
     assert "Bearer test-key-only" in transport.calls[0]["headers"]["Authorization"]
 
 
+def test_ai_configuration_validation_reports_invalid_numeric_and_url_values(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("AI_MODEL", "test-model")
+    monkeypatch.setenv("AI_API_KEY", "secret-key")
+    monkeypatch.setenv("AI_BASE_URL", "not-a-url")
+    monkeypatch.setenv("AI_TIMEOUT_SECONDS", "not-a-number")
+
+    config = AIConfig.from_env()
+
+    assert "AI_BASE_URL must be an absolute HTTP(S) URL" in config.configuration_errors
+    assert "AI_TIMEOUT_SECONDS must be numeric" in config.configuration_errors
+    assert config.api_key == "secret-key"
+
+    monkeypatch.setenv("AI_BASE_URL", "https://user:password@llm.example.test/v1")
+    assert "AI_BASE_URL must not contain URL credentials" in AIConfig.from_env().configuration_errors
+
+
+def test_ai_missing_credentials_are_not_configured_and_never_call_transport(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("AI_MODEL", "test-model")
+    monkeypatch.setenv("AI_BASE_URL", "https://llm.example.test/v1")
+    monkeypatch.delenv("AI_API_KEY", raising=False)
+    transport = FakeTransport([])
+    provider = HttpLLMProvider(AIConfig.from_env(), transport=transport)
+
+    assert provider.status().status == "unavailable"
+    assert provider.status().configured is False
+    with pytest.raises(AIUnavailableError, match="AI_API_KEY"):
+        provider.check_connectivity()
+    assert transport.calls == []
+
+
+def test_ai_connectivity_check_is_minimal_structured_and_records_no_secret():
+    transport = FakeTransport([
+        response({
+            "id": "connectivity-1",
+            "choices": [{"message": {"content": '{"ok":true}'}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+        })
+    ])
+    provider = HttpLLMProvider(ai_config(), transport=transport)
+
+    result = provider.check_connectivity()
+
+    assert result.output == {"ok": True}
+    request = json.loads(transport.calls[0]["body"])
+    assert request["messages"][1]["content"] == "Connectivity check. Do not perform any outreach."
+    assert "test-key-only" not in json.dumps(request)
+    assert result.usage.total_tokens == 5
+
+
+@pytest.mark.parametrize(
+    ("status_code", "category"),
+    [(401, "authentication_error"), (429, "rate_limited"), (500, "provider_error")],
+)
+def test_ai_connectivity_check_distinguishes_provider_errors(status_code, category):
+    provider = HttpLLMProvider(ai_config(max_retries=0), transport=FakeTransport([response({"error": {"message": "test-key-only rejected"}}, status_code=status_code)]))
+
+    with pytest.raises(AIConnectivityError) as error:
+        provider.check_connectivity()
+
+    assert error.value.category == category
+    assert "test-key-only" not in str(error.value)
+
+
+def test_ai_connectivity_check_distinguishes_timeout_and_invalid_response():
+    timeout_provider = HttpLLMProvider(ai_config(max_retries=0), transport=FakeTransport([TimeoutError()]))
+    with pytest.raises(AIConnectivityError) as timeout_error:
+        timeout_provider.check_connectivity()
+    assert timeout_error.value.category == "timeout"
+
+    invalid_provider = HttpLLMProvider(ai_config(max_retries=0), transport=FakeTransport([response({"choices": [{"message": {"content": '{"ok":false}'}}]})]))
+    with pytest.raises(AIConnectivityError) as invalid_error:
+        invalid_provider.check_connectivity()
+    assert invalid_error.value.category == "invalid_response"
+
+
 def test_ai_provider_does_not_fabricate_when_provider_returns_unstructured_content():
     transport = FakeTransport(
         [response({"choices": [{"message": {"content": "I cannot produce JSON"}}]})]
@@ -170,6 +247,7 @@ def test_unconfigured_ai_and_gmail_routes_are_explicit_and_secret_free(client, m
         monkeypatch.delenv(key, raising=False)
 
     headers = {"X-Local-Token": "test-token"}
+    assert client.post("/api/ai/connectivity").status_code == 401
     ai_status = client.get("/api/ai/status", headers=headers)
     assert ai_status.status_code == 200
     assert ai_status.json()["status"] == "unavailable"
@@ -192,6 +270,44 @@ def test_unconfigured_ai_and_gmail_routes_are_explicit_and_secret_free(client, m
     assert gmail_status.status_code == 200
     assert gmail_status.json()["configured"] is False
     assert gmail_status.json()["supports_live_send"] is False
+
+    connectivity = client.post("/api/ai/connectivity", headers=headers)
+    assert connectivity.status_code == 200
+    assert connectivity.json()["status"] == "not_configured"
+    assert "AI_API_KEY" not in connectivity.text
+
+
+def test_ai_config_update_persists_non_secret_settings_and_connectivity_usage(client, monkeypatch):
+    monkeypatch.setenv("AI_API_KEY", "secret-key")
+    headers = {"X-Local-Token": "test-token"}
+    updated = client.patch(
+        "/api/ai/config",
+        headers=headers,
+        json={
+            "provider": "test-llm",
+            "model": "test-model",
+            "base_url": "https://llm.example.test/v1",
+            "timeout_seconds": 4,
+            "max_retries": 1,
+            "retry_backoff_seconds": 0,
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["model"] == "test-model"
+    assert updated.json()["api_key_configured"] is True
+    assert "secret-key" not in updated.text
+
+    client.app.state.services.ai.registry.transport = FakeTransport([
+        response({"id": "check-1", "choices": [{"message": {"content": '{"ok":true}'}}], "usage": {"total_tokens": 2}})
+    ])
+    connectivity = client.post("/api/ai/connectivity", headers=headers)
+    assert connectivity.status_code == 200
+    assert connectivity.json()["status"] == "connected"
+    assert "secret-key" not in connectivity.text
+
+    usage = client.get("/api/ai/usage", headers=headers)
+    assert usage.json()["requests"] == 1
+    assert usage.json()["total_tokens"] == 2
 
 
 def test_gmail_authorization_url_uses_official_endpoint_and_no_network():

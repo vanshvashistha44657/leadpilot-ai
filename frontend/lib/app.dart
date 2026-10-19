@@ -6,6 +6,7 @@ import 'screens/alerts_screen.dart';
 import 'screens/campaigns_screen.dart';
 import 'screens/clients_screen.dart';
 import 'screens/dashboard_screen.dart';
+import 'screens/drafts_screen.dart';
 import 'screens/fulfillment_screen.dart';
 import 'screens/leads_screen.dart';
 import 'screens/pricing_screen.dart';
@@ -60,6 +61,7 @@ class _AppShellState extends State<AppShell> {
   static const _items = [
     _NavItem('Overview', Icons.grid_view_rounded),
     _NavItem('Leads & import', Icons.people_alt_outlined),
+    _NavItem('Draft review', Icons.rate_review_outlined),
     _NavItem('Campaigns', Icons.campaign_outlined),
     _NavItem('Clients & projects', Icons.business_center_outlined),
     _NavItem('Pricing & profit', Icons.show_chart_rounded),
@@ -71,6 +73,7 @@ class _AppShellState extends State<AppShell> {
   List<Widget> get _screens => [
         DashboardScreen(api: widget.api),
         LeadsScreen(api: widget.api),
+        DraftsScreen(api: widget.api),
         CampaignsScreen(api: widget.api),
         ClientsScreen(api: widget.api),
         PricingScreen(api: widget.api),
@@ -165,7 +168,7 @@ class _AppShellState extends State<AppShell> {
                             ),
                             IconButton(
                               tooltip: 'Open alerts',
-                               onPressed: () => setState(() => _selectedIndex = 6),
+                               onPressed: () => setState(() => _selectedIndex = 7),
                               icon: const Icon(Icons.notifications_none_rounded),
                             ),
                             const SizedBox(width: 8),

@@ -150,9 +150,11 @@ Secrets belong in a local secret manager or environment configuration, never in 
 - `GET /api/dashboard/metrics`
 - `GET /api/leads?limit=100&offset=0&search=...`
 - `GET /api/leads/count`, `GET /api/leads/{id}`, `GET /api/leads/{id}/history`
-- `POST /api/leads/import` for direct small imports; `POST /api/leads/import/queue` for background imports
+- `POST /api/leads/import/preview` for bounded CSV/XLSX preview and suggested mapping
+- `POST /api/leads/import` for validated direct imports; `POST /api/leads/import/queue` for background imports after preview/mapping
 - `GET /api/leads/export.csv`
 - `POST /api/leads/{id}/research`
+- `POST /api/drafts/generate`, `GET /api/drafts`, `PATCH /api/drafts/{id}` for AI draft review/editing only
 - `POST /api/suppressions`, `GET /api/suppressions`
 - `POST /api/campaigns`, `POST /api/campaigns/{id}/outreach/preview`, `POST /api/campaigns/{id}/outreach/run`
 - `GET /api/jobs/{id}`, `POST /api/jobs/{id}/cancel`, `POST /api/jobs/{id}/retry`
@@ -161,6 +163,7 @@ Secrets belong in a local secret manager or environment configuration, never in 
 - `POST /api/pricing/calculate`
 - `POST /api/briefs/generate`
 - `GET /api/ai/status`, `GET /api/ai/config`, `GET /api/ai/usage`
+- `PATCH /api/ai/config` for non-secret provider settings and `POST /api/ai/connectivity` for a minimal structured provider check
 - `POST /api/ai/personalization/preview`, `POST /api/ai/reply-classification/preview`, `POST /api/ai/brief/preview`
 - `GET /api/gmail/status`, `GET /api/gmail/health`, `GET /api/gmail/auth-url`, `GET /api/gmail/oauth/callback`
 - `GET/POST /api/packages`, `POST /api/packages/recommend`, `POST /api/packages/{id}/profit`
@@ -169,9 +172,89 @@ Secrets belong in a local secret manager or environment configuration, never in 
 - `POST /api/clients`, `GET /api/clients`, `POST /api/projects`, `GET /api/projects`
 - `GET /api/providers`, `GET/PATCH /api/settings`, `POST /api/backup`
 
+### AI provider setup and connectivity
+
+The current AI adapter sends OpenAI-compatible JSON requests to
+`{AI_BASE_URL}/chat/completions`. The following names are read from the backend
+process environment or the non-secret Settings UI fields:
+
+```text
+AI_PROVIDER=none                 # any non-none label uses the OpenAI-compatible adapter
+AI_MODEL=                        # required when a provider is enabled
+AI_BASE_URL=https://api.openai.com/v1
+AI_API_KEY=                      # required, environment/secret-store only
+AI_TIMEOUT_SECONDS=20
+AI_MAX_RETRIES=2
+AI_RETRY_BACKOFF_SECONDS=0.25
+```
+
+The backend never returns `AI_API_KEY`, stores it in SQLite, writes it to logs,
+or accepts it from the Flutter UI. Configure it in the process environment or
+an approved local secret manager, for example in a private PowerShell session:
+
+```powershell
+$env:AI_PROVIDER = "openai-compatible"
+$env:AI_MODEL = "your-model-name"
+$env:AI_BASE_URL = "https://api.openai.com/v1"
+$env:AI_API_KEY = "<set-this-locally-never-in-chat>"
+$env:AI_TIMEOUT_SECONDS = "20"
+$env:AI_MAX_RETRIES = "2"
+$env:AI_RETRY_BACKOFF_SECONDS = "0.25"
+```
+
+Start or restart the backend after changing environment values. In the desktop
+Settings screen, the **AI provider configuration** card can display the
+sanitized active configuration and save non-secret provider/model/base URL/
+timeout/retry values. Use **Test connectivity** to send only a minimal
+structured request stating that it is a connectivity check; it does not create
+personalized outreach, create a draft, or send email. The result distinguishes
+missing configuration, invalid configuration, authentication errors, rate
+limits, network failures, timeouts, invalid responses, and other provider
+errors. Successful checks are recorded as `connectivity_check` usage events;
+prompts, responses, and secrets are not persisted.
+
+AI preview output is validated against strict Pydantic schemas. Provider
+requests use bounded retries and the configured timeout. `DRY_RUN=true`,
+`LIVE_SENDING_ENABLED=false`, `GMAIL_LIVE_SEND_APPROVED=false`, and
+`GMAIL_LIVE_SEND_TESTED=false` remain the safe desktop defaults; Phase 1 adds
+no email-send path.
+
+### Phase 2 lead import and draft workflow
+
+Lead import is a two-step desktop workflow:
+
+1. In **Leads & import**, enter a local `.csv` or `.xlsx` path.
+2. Select **Import** to upload a bounded preview. Review detected columns,
+   sample rows, suggested mappings, row limits, and preview errors.
+3. Map the required email column and optional first name, last name, company,
+   title, and source columns. Ignored columns are not stored.
+4. Queue the import. The backend revalidates the complete file, normalizes
+   emails, deduplicates within the upload and against SQLite, checks the global
+   suppression table, and reports processed/imported/duplicate/suppressed/
+   invalid/skipped counts. Files are limited to 25 MB and 100,000 rows; XLSX
+   decompressed content is limited to 100 MB.
+
+Lead records remain searchable and paginated. Selecting a row opens the
+operator-review flow for verified website/evidence notes and deterministic
+qualification scoring. Scores use only supplied lead fields and explicitly
+stored operator-verified research; no web facts are invented. Source and
+research evidence remain visible on the lead record, and review actions are
+audited.
+
+The **Generate draft** action is available for eligible, non-suppressed leads.
+Provide a service/offer brief, tone, and call to action. The configured AI
+provider receives only the selected lead fields and verified research fields,
+with instructions not to invent company facts, achievements, prior
+interactions, or missing details. The structured subject/body response is
+validated and stored as a reviewable draft with provider/model/usage metadata.
+Drafts can be edited and regenerated; edited content is marked separately from
+the original generated subject/body. Phase 2 does not send, schedule, or create
+Gmail drafts. Suppressed, unsubscribed, replied, or bounced leads are blocked
+again immediately before generation and outreach preview.
+
 ## Database and backup
 
-SQLite migrations are applied automatically on startup and tracked with `PRAGMA user_version` plus `schema_version` rows. The current schema is migration version 4 and includes leads, suppressions, campaigns, jobs, outreach events, audit logs, alerts, research fields, replies, clients, proposals, projects, payments, renewals, website packages, follow-up queue entries, and AI usage events. The backup endpoint uses SQLite's online backup API and writes to `backend/backups/` by default.
+SQLite migrations are applied automatically on startup and tracked with `PRAGMA user_version` plus `schema_version` rows. The current schema is migration version 5 and includes leads, suppressions, campaigns, jobs, outreach events, audit logs, alerts, research fields, replies, clients, proposals, projects, payments, renewals, website packages, follow-up queue entries, AI usage events, import batches/errors/provenance, and reviewable personalized drafts. The backup endpoint uses SQLite's online backup API and writes to `backend/backups/` by default.
 
 The PostgreSQL/multi-device option is intentionally not enabled in this local release. The repository/service boundaries keep that migration possible without moving business rules into the UI.
 

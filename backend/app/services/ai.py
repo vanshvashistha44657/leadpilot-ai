@@ -4,7 +4,8 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Generic, Protocol, TypeVar
+from datetime import datetime, timezone
+from typing import Any, Callable, Generic, Mapping, Protocol, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import ValidationError
@@ -16,6 +17,8 @@ from ..models import (
     AIPersonalizationRequest,
     AIProviderConfigOut,
     AIProviderStatus,
+    AIProviderConfigUpdate,
+    AIConnectivityResult,
     AIReplyClassificationOutput,
     AIUsageMetadata,
     BriefRequest,
@@ -27,20 +30,20 @@ AI_CAPABILITIES = ["personalization", "reply_classification", "brief_generation"
 RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 
-def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+def _bounded_float(value: str | None, default: float, *, minimum: float, maximum: float) -> float:
     try:
-        value = float(os.getenv(name, str(default)))
+        parsed = float(value if value is not None else default)
     except ValueError:
         return default
-    return min(max(value, minimum), maximum)
+    return min(max(parsed, minimum), maximum)
 
 
-def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+def _bounded_int(value: str | None, default: int, *, minimum: int, maximum: int) -> int:
     try:
-        value = int(os.getenv(name, str(default)))
+        parsed = int(value if value is not None else default)
     except ValueError:
         return default
-    return min(max(value, minimum), maximum)
+    return min(max(parsed, minimum), maximum)
 
 
 def _public_base_url(value: str) -> str | None:
@@ -69,22 +72,55 @@ class AIConfig:
     timeout_seconds: float = 20.0
     max_retries: int = 2
     retry_backoff_seconds: float = 0.25
+    configuration_errors: tuple[str, ...] = ()
 
     @classmethod
-    def from_env(cls) -> "AIConfig":
+    def from_env(cls, overrides: Mapping[str, str] | None = None) -> "AIConfig":
+        values = dict(os.environ)
+        if overrides:
+            values.update({key: value for key, value in overrides.items() if value is not None})
+        provider = values.get("AI_PROVIDER", "none").strip().lower() or "none"
+        model = values.get("AI_MODEL", "").strip()
+        base_url = values.get("AI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+        api_key = os.getenv("AI_API_KEY", "").strip()
+        errors: list[str] = []
+        if provider not in {"", "none", "disabled"}:
+            try:
+                parts = urlsplit(base_url)
+                _ = parts.port
+                if parts.scheme not in {"http", "https"} or not parts.hostname:
+                    errors.append("AI_BASE_URL must be an absolute HTTP(S) URL")
+                if parts.username or parts.password:
+                    errors.append("AI_BASE_URL must not contain URL credentials")
+            except ValueError:
+                errors.append("AI_BASE_URL must be an absolute HTTP(S) URL")
+        for name, minimum, maximum in (
+            ("AI_TIMEOUT_SECONDS", 0.1, 300.0),
+            ("AI_MAX_RETRIES", 0, 5),
+            ("AI_RETRY_BACKOFF_SECONDS", 0.0, 10.0),
+        ):
+            raw = values.get(name)
+            if raw is not None:
+                try:
+                    number = float(raw) if name != "AI_MAX_RETRIES" else int(raw)
+                    if number < minimum or number > maximum:
+                        errors.append(f"{name} must be between {minimum} and {maximum}")
+                except ValueError:
+                    errors.append(f"{name} must be numeric")
         return cls(
-            provider=os.getenv("AI_PROVIDER", "none").strip().lower() or "none",
-            model=os.getenv("AI_MODEL", "").strip(),
-            base_url=os.getenv("AI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/"),
-            api_key=os.getenv("AI_API_KEY", "").strip(),
-            timeout_seconds=_env_float("AI_TIMEOUT_SECONDS", 20.0, minimum=0.1, maximum=300.0),
-            max_retries=_env_int("AI_MAX_RETRIES", 2, minimum=0, maximum=5),
-            retry_backoff_seconds=_env_float("AI_RETRY_BACKOFF_SECONDS", 0.25, minimum=0.0, maximum=10.0),
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout_seconds=_bounded_float(values.get("AI_TIMEOUT_SECONDS"), 20.0, minimum=0.1, maximum=300.0),
+            max_retries=_bounded_int(values.get("AI_MAX_RETRIES"), 2, minimum=0, maximum=5),
+            retry_backoff_seconds=_bounded_float(values.get("AI_RETRY_BACKOFF_SECONDS"), 0.25, minimum=0.0, maximum=10.0),
+            configuration_errors=tuple(errors),
         )
 
     @property
     def credentials_present(self) -> bool:
-        return self.provider not in {"", "none", "disabled"} and bool(self.api_key and self.model and self.base_url)
+        return self.provider not in {"", "none", "disabled"} and not self.configuration_errors and bool(self.api_key and self.model and self.base_url)
 
 
 T = TypeVar("T")
@@ -105,6 +141,12 @@ class AIUnavailableError(RuntimeError):
 
 class AIProviderError(RuntimeError):
     pass
+
+
+class AIConnectivityError(AIProviderError):
+    def __init__(self, category: str, detail: str):
+        super().__init__(detail)
+        self.category = category
 
 
 class AIProvider(Protocol):
@@ -142,7 +184,7 @@ def _usage_metadata(payload: dict[str, Any]) -> AIUsageMetadata:
     )
 
 
-def _error_detail(response: HttpResponse) -> str:
+def _error_detail(response: HttpResponse, secret: str = "") -> str:
     try:
         payload = json.loads(response.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -150,9 +192,11 @@ def _error_detail(response: HttpResponse) -> str:
     if isinstance(payload, dict):
         error = payload.get("error")
         if isinstance(error, dict) and isinstance(error.get("message"), str):
-            return error["message"][:500]
+            detail = error["message"][:500]
+            return detail.replace(secret, "[REDACTED]") if secret else detail
         if isinstance(payload.get("message"), str):
-            return payload["message"][:500]
+            detail = payload["message"][:500]
+            return detail.replace(secret, "[REDACTED]") if secret else detail
     return f"HTTP {response.status_code} from AI provider"
 
 
@@ -176,14 +220,15 @@ class HttpLLMProvider:
                 reason="AI provider is not configured",
             )
         if not self.config.credentials_present:
+            reason = "; ".join(self.config.configuration_errors) or "AI provider requires AI_API_KEY, AI_MODEL, and AI_BASE_URL"
             return AIProviderStatus(
                 name=self.name,
-                status="unavailable",
+                status="error" if self.config.configuration_errors else "unavailable",
                 configured=False,
                 model=self.config.model or None,
                 capabilities=AI_CAPABILITIES,
                 api_key_configured=bool(self.config.api_key),
-                reason="AI provider requires AI_API_KEY, AI_MODEL, and AI_BASE_URL",
+                reason=reason,
             )
         return AIProviderStatus(
             name=self.name,
@@ -196,6 +241,8 @@ class HttpLLMProvider:
         )
 
     def _ensure_configured(self) -> None:
+        if self.config.configuration_errors:
+            raise AIConnectivityError("invalid_configuration", "; ".join(self.config.configuration_errors))
         if not self.config.credentials_present:
             raise AIUnavailableError(self.status().reason)
 
@@ -217,10 +264,17 @@ class HttpLLMProvider:
                     body=body,
                     timeout=self.config.timeout_seconds,
                 )
-            except (OSError, TimeoutError, URLError) as exc:
+            except TimeoutError as exc:
                 last_error = exc
                 if attempt >= self.config.max_retries:
-                    raise AIProviderError("AI provider request failed after retries") from exc
+                    raise AIConnectivityError("timeout", "AI provider request timed out after retries") from exc
+                if self.config.retry_backoff_seconds:
+                    time.sleep(self.config.retry_backoff_seconds * (2**attempt))
+                continue
+            except (OSError, URLError) as exc:
+                last_error = exc
+                if attempt >= self.config.max_retries:
+                    raise AIConnectivityError("network_error", "AI provider network request failed after retries") from exc
                 if self.config.retry_backoff_seconds:
                     time.sleep(self.config.retry_backoff_seconds * (2**attempt))
                 continue
@@ -230,13 +284,14 @@ class HttpLLMProvider:
                     time.sleep(self.config.retry_backoff_seconds * (2**attempt))
                 continue
             if not 200 <= response.status_code < 300:
-                raise AIProviderError(_error_detail(response))
+                category = "authentication_error" if response.status_code in {401, 403} else "rate_limited" if response.status_code == 429 else "provider_error"
+                raise AIConnectivityError(category, _error_detail(response, self.config.api_key))
             try:
                 decoded = json.loads(response.body.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise AIProviderError("AI provider returned invalid JSON") from exc
+                raise AIConnectivityError("invalid_response", "AI provider returned invalid JSON") from exc
             if not isinstance(decoded, dict):
-                raise AIProviderError("AI provider returned an invalid response object")
+                raise AIConnectivityError("invalid_response", "AI provider returned an invalid response object")
             return decoded, decoded.get("id") if isinstance(decoded.get("id"), str) else None
         raise AIProviderError("AI provider request failed after retries") from last_error
 
@@ -304,6 +359,26 @@ class HttpLLMProvider:
             request_id=request_id,
         )
 
+    def check_connectivity(self) -> AIResult[dict[str, Any]]:
+        payload, request_id = self._request(
+            {
+                "model": self.config.model,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": "Return only the JSON object {\"ok\":true}."},
+                    {"role": "user", "content": "Connectivity check. Do not perform any outreach."},
+                ],
+            }
+        )
+        try:
+            content = self._structured_content(payload)
+        except AIProviderError as exc:
+            raise AIConnectivityError("invalid_response", str(exc)) from exc
+        if content != {"ok": True}:
+            raise AIConnectivityError("invalid_response", "AI provider returned an invalid connectivity response")
+        return AIResult(output=content, usage=_usage_metadata(payload), provider=self.name, model=self.config.model, request_id=request_id)
+
     def personalize(self, request: AIPersonalizationRequest) -> AIResult[AIPersonalizationOutput]:
         return self._generate(
             "personalization",
@@ -343,29 +418,43 @@ class UnavailableAIProvider(HttpLLMProvider):
 
 
 class AIProviderRegistry:
-    def __init__(self, transport: HttpTransport | None = None):
+    def __init__(self, transport: HttpTransport | None = None, config_loader: Callable[[], AIConfig] | None = None):
         self.transport = transport
+        self.config_loader = config_loader
 
     def current(self) -> HttpLLMProvider:
-        config = AIConfig.from_env()
+        config = self.config_loader() if self.config_loader else AIConfig.from_env()
         if config.provider in {"", "none", "disabled"}:
             return UnavailableAIProvider(config)
         return HttpLLMProvider(config, transport=self.transport)
 
 
 class AIService:
-    def __init__(self, registry: AIProviderRegistry | None = None):
+    def __init__(self, registry: AIProviderRegistry | None = None, settings_repository: Any | None = None):
+        self.settings_repository = settings_repository
         self.registry = registry or AIProviderRegistry()
+        self.registry.config_loader = self._current_config
+
+    def _current_config(self) -> AIConfig:
+        overrides: dict[str, str] = {}
+        if self.settings_repository is not None:
+            stored = self.settings_repository.all()
+            for key in ("provider", "model", "base_url", "timeout_seconds", "max_retries", "retry_backoff_seconds"):
+                if f"ai_{key}" in stored:
+                    overrides[f"AI_{key.upper()}"] = stored[f"ai_{key}"]
+        return AIConfig.from_env(overrides)
 
     def config(self) -> AIProviderConfigOut:
-        config = AIConfig.from_env()
+        config = self._current_config()
         return AIProviderConfigOut(
             provider=config.provider,
             model=config.model or None,
             base_url=_public_base_url(config.base_url),
             timeout_seconds=config.timeout_seconds,
             max_retries=config.max_retries,
+            retry_backoff_seconds=config.retry_backoff_seconds,
             api_key_configured=bool(config.api_key),
+            configuration_errors=list(config.configuration_errors),
         )
 
     def status(self) -> AIProviderStatus:
@@ -379,3 +468,27 @@ class AIService:
 
     def generate_brief(self, request: BriefRequest) -> AIResult[AIBriefOutput]:
         return self.registry.current().generate_brief(request)
+
+    def update_config(self, update: AIProviderConfigUpdate) -> AIProviderConfigOut:
+        if self.settings_repository is None:
+            raise ValueError("AI settings storage is unavailable")
+        values = update.model_dump(exclude_none=True)
+        if "base_url" in values:
+            value = str(values["base_url"]).strip().rstrip("/")
+            parts = urlsplit(value)
+            if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+                raise ValueError("AI base URL must be an absolute HTTP(S) URL")
+            values["base_url"] = value
+        self.settings_repository.update({f"ai_{key}": str(value) for key, value in values.items()})
+        return self.config()
+
+    def check_connectivity(self) -> AIConnectivityResult:
+        provider = self.registry.current()
+        checked_at = datetime.now(timezone.utc)
+        try:
+            result = provider.check_connectivity()
+        except AIUnavailableError as exc:
+            return AIConnectivityResult(status="not_configured", provider=provider.name, model=provider.config.model or None, detail=str(exc), checked_at=checked_at)
+        except AIConnectivityError as exc:
+            return AIConnectivityResult(status=exc.category, provider=provider.name, model=provider.config.model or None, detail=str(exc), checked_at=checked_at)
+        return AIConnectivityResult(status="connected", provider=result.provider, model=result.model, detail="AI provider accepted the connectivity check; no outreach was generated or sent.", checked_at=checked_at, request_id=result.request_id, usage=result.usage)

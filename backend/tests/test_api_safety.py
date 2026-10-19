@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+from app.api import routes as api_routes
+
 
 def auth_headers() -> dict[str, str]:
     return {"X-Local-Token": "test-token"}
@@ -103,9 +105,94 @@ def test_large_import_can_be_queued(client):
     job = wait_for_job(client, response.json()["id"])
     assert job["status"] == "completed"
     assert job["result"]["imported"] == 1
+    sources = client.app.state.services.import_batches.list_sources(job["result"]["batch_id"])
+    assert [(source["source_row"], source["source_label"]) for source in sources] == [(2, "csv")]
     assert client.get("/api/leads", headers=auth_headers()).json()[0]["email"] == "queued@example.com"
     incoming = client.app.state.services.database.path.parent / "incoming"
     assert not list(incoming.glob("*"))
+
+
+def test_direct_import_failure_finalizes_batch_and_records_error(client):
+    response = client.post(
+        "/api/leads/import",
+        headers=auth_headers(),
+        files={"file": ("broken.xlsx", b"not an xlsx archive", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert response.status_code == 422
+
+    with client.app.state.services.database.session() as connection:
+        batch = connection.execute("SELECT * FROM import_batches").fetchone()
+    assert batch["status"] == "failed"
+    assert batch["error_count"] == 1
+    errors = client.app.state.services.import_batches.list_errors(batch["id"])
+    assert errors[0]["row_number"] == 0
+    assert errors[0]["field_name"] is None
+    assert errors[0]["error_code"] == "direct_import_error"
+    assert "File is not a zip file" in errors[0]["message"]
+
+
+def test_queued_staging_failure_finalizes_batch(client, monkeypatch):
+    def fail_copy(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(api_routes.shutil, "copyfileobj", fail_copy)
+    response = client.post(
+        "/api/leads/import/queue",
+        headers=auth_headers(),
+        files={"file": ("leads.csv", b"email\nstaged@example.com\n", "text/csv")},
+    )
+    assert response.status_code == 500
+
+    with client.app.state.services.database.session() as connection:
+        batch = connection.execute("SELECT * FROM import_batches").fetchone()
+    assert batch["status"] == "failed"
+    assert batch["error"] == "disk full"
+    assert client.app.state.services.import_batches.list_errors(batch["id"])[0]["error_code"] == "staging_error"
+
+
+def test_queued_worker_failure_finalizes_batch(client, monkeypatch):
+    def fail_process(*args, **kwargs):
+        raise RuntimeError("parser crashed")
+
+    monkeypatch.setattr(client.app.state.services.imports, "process", fail_process)
+    response = client.post(
+        "/api/leads/import/queue",
+        headers=auth_headers(),
+        files={"file": ("leads.csv", b"email\nworker@example.com\n", "text/csv")},
+    )
+    assert response.status_code == 202
+    job = wait_for_job(client, response.json()["id"])
+    assert job["status"] == "failed"
+
+    batch_id = job["payload"]["batch_id"]
+    with client.app.state.services.database.session() as connection:
+        batch = connection.execute("SELECT * FROM import_batches WHERE id = ?", (batch_id,)).fetchone()
+    assert batch["status"] == "failed"
+    assert batch["error"] == "parser crashed"
+    assert client.app.state.services.import_batches.list_errors(batch_id)[0]["error_code"] == "worker_processing_error"
+
+
+def test_import_endpoints_reject_unsupported_extension(client):
+    for endpoint in ("/api/leads/import", "/api/leads/import/preview", "/api/leads/import/queue"):
+        response = client.post(
+            endpoint,
+            headers=auth_headers(),
+            files={"file": ("leads.txt", b"email\nunsupported@example.com\n", "text/plain")},
+        )
+        assert response.status_code == 422
+
+
+def test_import_endpoints_reject_upload_limit(client):
+    client.app.state.services.imports.MAX_BYTES = 4
+    upload = {"file": ("leads.csv", b"email\nlarge@example.com\n", "text/csv")}
+
+    direct = client.post("/api/leads/import", headers=auth_headers(), files=upload)
+    preview = client.post("/api/leads/import/preview", headers=auth_headers(), files=upload)
+    queued = client.post("/api/leads/import/queue", headers=auth_headers(), files=upload)
+
+    assert direct.status_code == 422
+    assert preview.status_code == 413
+    assert queued.status_code == 413
 
 
 def test_provider_credentials_do_not_enable_unimplemented_live_send(client, monkeypatch):

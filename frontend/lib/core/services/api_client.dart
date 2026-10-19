@@ -91,9 +91,9 @@ class ApiService {
     }
   }
 
-  Future<dynamic> _sendMultipartFile(String method, String path, File file, String filename) async {
+  Future<dynamic> _sendMultipartFile(String method, String path, File file, String filename, {Map<String, String>? query}) async {
     final boundary = 'LeadPilotBoundary${DateTime.now().microsecondsSinceEpoch}';
-    final uri = Uri.parse('${config.baseUrl}$path');
+    final uri = Uri.parse('${config.baseUrl}$path').replace(queryParameters: query);
     try {
       final request = await _client.openUrl(method, uri).timeout(const Duration(seconds: 20));
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
@@ -176,13 +176,26 @@ class ApiService {
     return ImportResult.fromJson(_object(result));
   }
 
-  Future<Job> queueImportLeads(String filePath) async {
+  Future<ImportPreview> previewLeadImport(String filePath) async {
     final file = File(filePath);
     if (!await file.exists()) throw const ApiException('That import file does not exist.');
     final filename = file.uri.pathSegments.isEmpty ? 'leads.csv' : file.uri.pathSegments.last;
-    final result = await _sendMultipartFile('POST', '/api/leads/import/queue', file, filename);
+    return ImportPreview.fromJson(_object(await _sendMultipartFile('POST', '/api/leads/import/preview', file, filename)));
+  }
+
+  Future<Job> queueImportLeads(String filePath, {JsonMap? mapping}) async {
+    final file = File(filePath);
+    if (!await file.exists()) throw const ApiException('That import file does not exist.');
+    final filename = file.uri.pathSegments.isEmpty ? 'leads.csv' : file.uri.pathSegments.last;
+    final result = await _sendMultipartFile('POST', '/api/leads/import/queue', file, filename, query: mapping == null ? null : {'mapping': jsonEncode(mapping)});
     return Job.fromJson(_object(result));
   }
+
+  Future<PersonalizedDraft> generateDraft({required int leadId, required String offer, required String tone, required String callToAction, bool regenerate = false}) async => PersonalizedDraft.fromJson(_object(await _send('POST', '/api/drafts/generate', body: {'lead_id': leadId, 'offer': offer, 'tone': tone, 'call_to_action': callToAction, 'regenerate': regenerate})));
+
+  Future<List<PersonalizedDraft>> listDrafts({String? status}) async => _objects(await _send('GET', '/api/drafts', query: {if (status != null) 'status': status})).map(PersonalizedDraft.fromJson).toList();
+
+  Future<PersonalizedDraft> updateDraft(String id, {required String subject, required String body}) async => PersonalizedDraft.fromJson(_object(await _send('PATCH', '/api/drafts/$id', body: {'subject': subject, 'body': body})));
 
   Uri leadsExportUri({String? search}) => Uri.parse('${config.baseUrl}/api/leads/export.csv').replace(queryParameters: {
         if (search != null && search.trim().isNotEmpty) 'search': search.trim(),
@@ -255,6 +268,10 @@ class ApiService {
   Future<AIProviderStatus> getAIStatus() async => AIProviderStatus.fromJson(_object(await _send('GET', '/api/ai/status')));
 
   Future<AIProviderConfig> getAIConfig() async => AIProviderConfig.fromJson(_object(await _send('GET', '/api/ai/config')));
+
+  Future<AIProviderConfig> updateAIConfig(JsonMap values) async => AIProviderConfig.fromJson(_object(await _send('PATCH', '/api/ai/config', body: values)));
+
+  Future<AIConnectivityResult> checkAIConnectivity() async => AIConnectivityResult.fromJson(_object(await _send('POST', '/api/ai/connectivity')));
 
   Future<AIUsageSummary> getAIUsage() async => AIUsageSummary.fromJson(_object(await _send('GET', '/api/ai/usage')));
 

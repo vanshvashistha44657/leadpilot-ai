@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import csv
 import io
+import json
 import shutil
 import zipfile
 from pathlib import Path
@@ -24,6 +25,8 @@ from ..models import (
     AIBriefPreview,
     AIUsageSummary,
     AIProviderConfigOut,
+    AIProviderConfigUpdate,
+    AIConnectivityResult,
     AIProviderStatus,
     AuditLogOut,
     BriefRequest,
@@ -39,6 +42,10 @@ from ..models import (
     GmailStatus,
     HealthResponse,
     ImportResult,
+    ImportPreview,
+    PersonalizedDraftRequest,
+    DraftOut,
+    DraftUpdate,
     JobOut,
     LeadCreate,
     LeadOut,
@@ -64,10 +71,12 @@ from ..models import (
 from ..services.normalization import clean_text, normalize_email
 from ..services.pricing import calculate_pricing
 from ..services.briefs import generate_client_brief
-from ..services.research import score_verified_lead
+from ..services.research import score_verified_lead, score_factors
 from ..services.replies import classify_reply
 from ..services.ai import AIProviderError, AIUnavailableError
+from ..services.drafts import DraftRateLimitError, DraftSuppressedError
 from ..services.gmail import GmailApiError, GmailMessage, GmailUnavailableError
+from ..services.jobs import JobCancelled
 
 router = APIRouter()
 ServiceDep = Annotated[Services, Depends(get_services)]
@@ -137,45 +146,104 @@ def create_lead(payload: LeadCreate, services: ServiceDep) -> LeadOut:
 
 
 @router.post("/api/leads/import", response_model=ImportResult, tags=["leads"])
-def import_leads(services: ServiceDep, file: UploadFile = File(...)) -> ImportResult:
+def import_leads(services: ServiceDep, file: UploadFile = File(...), mapping: str | None = Query(default=None, max_length=4000)) -> ImportResult:
     if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx")):
         raise HTTPException(status_code=422, detail="upload a .csv or .xlsx file")
+    batch_id: str | None = None
     try:
-        result = services.imports.process(file.file, file.filename)
+        parsed_mapping = json.loads(mapping) if mapping else None
+        if parsed_mapping is not None and not isinstance(parsed_mapping, dict):
+            raise ValueError("mapping must be a JSON object")
+        batch_id = str(uuid4())
+        services.import_batches.create(batch_id, Path(file.filename).name, Path(file.filename).suffix.lower().lstrip("."))
+        result = services.imports.process(file.file, file.filename, mapping=parsed_mapping, batch_id=batch_id)
+        services.import_batches.complete(batch_id, result)
     except (ValueError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        if batch_id:
+            services.import_batches.fail(batch_id, str(exc), error_code="direct_import_error")
         raise HTTPException(status_code=422, detail=f"could not read upload: {exc}") from exc
-    services.audit.record("lead.csv_imported", "local", {"filename": file.filename, "result": result})
+    result.setdefault("skipped", 0)
+    result["batch_id"] = batch_id
+    services.audit.record("lead.file_imported", "local", {"filename": Path(file.filename).name, "result": {key: value for key, value in result.items() if key not in {"errors"}}})
     return ImportResult.model_validate(result)
 
 
-@router.post("/api/leads/import/queue", response_model=JobOut, status_code=202, tags=["leads", "jobs"])
-def queue_lead_import(services: ServiceDep, file: UploadFile = File(...)) -> JobOut:
+@router.post("/api/leads/import/preview", response_model=ImportPreview, tags=["leads"])
+def preview_lead_import(services: ServiceDep, file: UploadFile = File(...)) -> ImportPreview:
     if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx")):
         raise HTTPException(status_code=422, detail="upload a .csv or .xlsx file")
+    try:
+        preview = services.imports.preview(file.file, Path(file.filename).name)
+    except (ValueError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise HTTPException(status_code=413 if "limit" in str(exc).lower() or "size" in str(exc).lower() else 422, detail=f"could not preview upload: {exc}") from exc
+    return ImportPreview.model_validate(preview)
+
+
+@router.post("/api/leads/import/queue", response_model=JobOut, status_code=202, tags=["leads", "jobs"])
+def queue_lead_import(services: ServiceDep, file: UploadFile = File(...), mapping: str | None = Query(default=None, max_length=4000)) -> JobOut:
+    if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx")):
+        raise HTTPException(status_code=422, detail="upload a .csv or .xlsx file")
+    try:
+        parsed_mapping = json.loads(mapping) if mapping else None
+        if parsed_mapping is not None and not isinstance(parsed_mapping, dict):
+            raise ValueError("mapping must be a JSON object")
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
+        if size > services.imports.MAX_BYTES:
+            raise HTTPException(status_code=413, detail="upload exceeds the 25 MB limit")
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    batch_id = str(uuid4())
+    services.import_batches.create(batch_id, Path(file.filename).name, Path(file.filename).suffix.lower().lstrip("."))
     incoming = services.database.path.parent / "incoming"
-    incoming.mkdir(parents=True, exist_ok=True)
     destination = incoming / f"{uuid4().hex}-{Path(file.filename).name}"
     try:
+        incoming.mkdir(parents=True, exist_ok=True)
         file.file.seek(0)
         with destination.open("wb") as target:
             shutil.copyfileobj(file.file, target, length=1024 * 1024)
-    except OSError as exc:
+    except Exception as exc:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+        services.import_batches.fail(batch_id, str(exc), error_code="staging_error")
         raise HTTPException(status_code=500, detail=f"could not stage upload: {exc}") from exc
 
     def run_import(context, payload):
-        staged_path = Path(payload["staged_path"])
-        with staged_path.open("rb") as source:
-            result = services.imports.process(source, payload["filename"], checkpoint=context.check_cancelled)
-        context.update_progress(100)
-        services.audit.record("lead.import_completed", "local", {"filename": payload["filename"], "result": result})
-        return result
+        try:
+            staged_path = Path(payload["staged_path"])
+            with staged_path.open("rb") as source:
+                result = services.imports.process(
+                    source,
+                    payload["filename"],
+                    checkpoint=context.check_cancelled,
+                    mapping=payload.get("mapping"),
+                    batch_id=payload["batch_id"],
+                )
+            result.setdefault("skipped", 0)
+            result["batch_id"] = payload["batch_id"]
+            services.import_batches.complete(payload["batch_id"], result)
+            context.update_progress(100)
+            services.audit.record("lead.import_completed", "local", {"filename": Path(payload["filename"]).name, "result": {key: value for key, value in result.items() if key not in {"errors"}}})
+            return result
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            services.import_batches.fail(payload["batch_id"], str(exc), error_code="worker_processing_error")
+            raise
 
     def cleanup_staged_file(job_id: str) -> None:
         current = services.jobs.get(job_id)
         if not current or current["status"] != "failed":
             destination.unlink(missing_ok=True)
 
-    job = services.queue.submit("lead_import", {"filename": file.filename, "staged_path": str(destination)}, run_import, cleanup=cleanup_staged_file)
+    try:
+        job = services.queue.submit("lead_import", {"filename": file.filename, "staged_path": str(destination), "mapping": parsed_mapping, "batch_id": batch_id}, run_import, cleanup=cleanup_staged_file)
+    except Exception as exc:
+        services.import_batches.fail(batch_id, str(exc), error_code="queue_submission_error")
+        raise HTTPException(status_code=500, detail=f"could not queue import: {exc}") from exc
     services.audit.record("lead.import_queued", "local", {"filename": file.filename, "job_id": job["id"]})
     return _job_out(job)
 
@@ -243,12 +311,16 @@ def research_lead(lead_id: int, payload: LeadResearchUpdate, services: ServiceDe
     if payload.website_url and not payload.website_url.lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=422, detail="website_url must use http:// or https://")
     score = score_verified_lead(lead, payload.website_url)
+    factors = score_factors(lead, payload.website_url)
     updated = services.leads.update_research(
         lead_id,
         score=score,
         status="reviewed",
         website_url=payload.website_url,
         notes=payload.verified_notes,
+        score_version="v1",
+        score_factors=factors,
+        research_source=payload.source,
     )
     services.audit.record("lead.research_reviewed", "local", {"lead_id": lead_id, "source": payload.source, "score": score})
     return LeadResearchOut(
@@ -423,6 +495,33 @@ def ai_config(services: ServiceDep) -> AIProviderConfigOut:
     return services.ai.config()
 
 
+@router.patch("/api/ai/config", response_model=AIProviderConfigOut, tags=["ai"])
+def update_ai_config(payload: AIProviderConfigUpdate, services: ServiceDep) -> AIProviderConfigOut:
+    try:
+        result = services.ai.update_config(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    services.audit.record("ai.config_updated", "local", {"keys": list(payload.model_dump(exclude_none=True))})
+    return result
+
+
+@router.post("/api/ai/connectivity", response_model=AIConnectivityResult, tags=["ai"])
+def ai_connectivity(services: ServiceDep) -> AIConnectivityResult:
+    result = services.ai.check_connectivity()
+    if result.status == "connected" and result.usage is not None:
+        services.ai_usage.record(
+            operation="connectivity_check",
+            provider=result.provider,
+            model=result.model or "",
+            request_id=result.request_id,
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            estimated_cost_usd=result.usage.estimated_cost_usd,
+        )
+    return result
+
+
 @router.post("/api/ai/personalization/preview", response_model=AIPersonalizationPreview, tags=["ai"])
 def ai_personalization_preview(payload: AIPersonalizationRequest, services: ServiceDep) -> AIPersonalizationPreview:
     try:
@@ -495,6 +594,41 @@ def ai_brief_preview(payload: BriefRequest, services: ServiceDep) -> AIBriefPrev
 @router.get("/api/ai/usage", response_model=AIUsageSummary, tags=["ai"])
 def ai_usage_summary(services: ServiceDep) -> AIUsageSummary:
     return AIUsageSummary.model_validate(services.ai_usage.summary())
+
+
+@router.post("/api/drafts/generate", response_model=DraftOut, tags=["drafts"])
+def generate_personalized_draft(payload: PersonalizedDraftRequest, services: ServiceDep) -> DraftOut:
+    try:
+        draft = services.draft_service.generate(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DraftSuppressedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DraftRateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except AIUnavailableError as exc:
+        services.audit.record("draft.generation_failed", "local", {"lead_id": payload.lead_id, "category": "not_configured"})
+        raise HTTPException(status_code=503, detail=f"AI draft generation unavailable: {exc}") from exc
+    except AIProviderError as exc:
+        services.audit.record("draft.generation_failed", "local", {"lead_id": payload.lead_id, "category": "provider_error"})
+        raise HTTPException(status_code=502, detail=f"AI draft generation provider error: {exc}") from exc
+    services.audit.record("draft.generated", "local", {"draft_id": draft.id, "lead_id": draft.lead_id, "status": draft.status, "provider": draft.provider, "model": draft.model})
+    return draft
+
+
+@router.get("/api/drafts", response_model=list[DraftOut], tags=["drafts"])
+def list_personalized_drafts(services: ServiceDep, status: str | None = Query(default=None, max_length=20), limit: int = Query(default=100, ge=1, le=500), offset: int = Query(default=0, ge=0)) -> list[DraftOut]:
+    return services.draft_service.list(status, limit, offset)
+
+
+@router.patch("/api/drafts/{draft_id}", response_model=DraftOut, tags=["drafts"])
+def update_personalized_draft(draft_id: str, payload: DraftUpdate, services: ServiceDep) -> DraftOut:
+    try:
+        draft = services.draft_service.update(draft_id, payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    services.audit.record("draft.edited", "local", {"draft_id": draft_id, "lead_id": draft.lead_id})
+    return draft
 
 
 @router.get("/api/gmail/status", response_model=GmailStatus, tags=["gmail"])

@@ -257,6 +257,10 @@ Color statusColor(String status) {
     case 'ready':
     case 'ok':
       return AppColors.mint;
+    case 'generated':
+      return AppColors.blue;
+    case 'edited':
+      return AppColors.purple;
     case 'failed':
     case 'critical':
     case 'suppressed':

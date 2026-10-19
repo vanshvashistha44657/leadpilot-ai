@@ -27,6 +27,10 @@ class LeadOut(LeadCreate):
     research_status: str = "unresearched"
     website_url: str | None = None
     research_notes: str | None = None
+    score_version: str = "v1"
+    score_factors: dict[str, Any] = Field(default_factory=dict)
+    research_source: str | None = None
+    research_verified_at: datetime | None = None
 
 
 class ImportResult(BaseModel):
@@ -36,6 +40,55 @@ class ImportResult(BaseModel):
     invalid: int
     processed: int
     errors: list[str] = Field(default_factory=list)
+    skipped: int = 0
+    batch_id: str | None = None
+
+
+class ImportPreview(BaseModel):
+    filename: str
+    file_type: Literal["csv", "xlsx"]
+    columns: list[str]
+    suggested_mapping: dict[str, str]
+    sample_rows: list[dict[str, str]]
+    row_count: int
+    limit_exceeded: bool = False
+    errors: list[str] = Field(default_factory=list)
+
+
+class PersonalizedDraftRequest(BaseModel):
+    lead_id: int = Field(gt=0)
+    offer: str = Field(min_length=1, max_length=2000)
+    tone: str = Field(default="professional", min_length=1, max_length=100)
+    call_to_action: str = Field(min_length=1, max_length=1000)
+    regenerate: bool = False
+
+
+class DraftUpdate(BaseModel):
+    subject: str = Field(min_length=1, max_length=500)
+    body: str = Field(min_length=1, max_length=10000)
+
+
+class DraftOut(BaseModel):
+    id: str
+    lead_id: int
+    status: Literal["generated", "edited", "failed"]
+    provider: str
+    model: str
+    subject: str
+    body: str
+    generated_subject: str
+    generated_body: str
+    offer: str
+    tone: str
+    call_to_action: str
+    request_id: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    estimated_cost_usd: float | None = None
+    error: str | None = None
+    generated_at: datetime
+    updated_at: datetime
 
 
 class SuppressionCreate(BaseModel):
@@ -424,7 +477,18 @@ class AIProviderConfigOut(BaseModel):
     base_url: str | None = None
     timeout_seconds: float
     max_retries: int
+    retry_backoff_seconds: float
     api_key_configured: bool
+    configuration_errors: list[str] = Field(default_factory=list)
+
+
+class AIProviderConfigUpdate(BaseModel):
+    provider: str | None = Field(default=None, min_length=1, max_length=80)
+    model: str | None = Field(default=None, max_length=200)
+    base_url: str | None = Field(default=None, max_length=2000)
+    timeout_seconds: float | None = Field(default=None, ge=0.1, le=300)
+    max_retries: int | None = Field(default=None, ge=0, le=5)
+    retry_backoff_seconds: float | None = Field(default=None, ge=0, le=10)
 
 
 class AIUsageMetadata(BaseModel):
@@ -434,6 +498,26 @@ class AIUsageMetadata(BaseModel):
     estimated_cost_usd: float | None = None
     currency: Literal["USD"] = "USD"
     available: bool = False
+
+
+class AIConnectivityResult(BaseModel):
+    status: Literal[
+        "connected",
+        "not_configured",
+        "invalid_configuration",
+        "authentication_error",
+        "rate_limited",
+        "network_error",
+        "timeout",
+        "invalid_response",
+        "provider_error",
+    ]
+    provider: str
+    model: str | None = None
+    detail: str
+    checked_at: datetime
+    request_id: str | None = None
+    usage: AIUsageMetadata | None = None
 
 
 class AIPersonalizationRequest(BaseModel):

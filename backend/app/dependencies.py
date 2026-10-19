@@ -17,6 +17,8 @@ from .repositories import (
     ClientRepository,
     SettingsRepository,
     AIUsageRepository,
+    DraftRepository,
+    ImportBatchRepository,
 )
 from .repositories_sales import (
     FollowUpRepository,
@@ -35,6 +37,7 @@ from .services.outreach import OutreachService
 from .services.followups import FollowUpService
 from .services.providers import ProviderRegistry
 from .services.settings import SettingsService
+from .services.drafts import DraftService
 
 
 @dataclass(slots=True)
@@ -65,6 +68,9 @@ class Services:
     follow_ups: FollowUpRepository
     followups: FollowUpService
     ai_usage: AIUsageRepository
+    drafts: DraftRepository
+    draft_service: DraftService
+    import_batches: ImportBatchRepository
 
 
 def get_services(request: Request) -> Services:

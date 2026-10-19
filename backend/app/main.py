@@ -22,6 +22,8 @@ from .repositories import (
     ClientRepository,
     SettingsRepository,
     AIUsageRepository,
+    DraftRepository,
+    ImportBatchRepository,
 )
 from .repositories_sales import (
     FollowUpRepository,
@@ -40,6 +42,7 @@ from .services.outreach import OutreachService
 from .services.followups import FollowUpService
 from .services.providers import ProviderRegistry
 from .services.settings import SettingsService
+from .services.drafts import DraftService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -62,11 +65,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     sales_metrics = SalesMetricsRepository(database)
     settings_repo = SettingsRepository(database)
     ai_usage = AIUsageRepository(database)
+    drafts = DraftRepository(database)
+    import_batches = ImportBatchRepository(database)
     alerts = AlertRepository(database)
     audit = AuditRepository(database)
     gmail = GmailService()
     providers = ProviderRegistry(gmail=gmail)
-    ai = AIService()
+    ai = AIService(settings_repository=settings_repo)
     settings_service = SettingsService(app_settings, settings_repo, providers)
     jobs.reconcile_interrupted()
     queue = JobQueue(jobs, can_start=lambda: not settings_service.public().automation_paused)
@@ -97,6 +102,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         follow_ups=follow_ups,
         followups=FollowUpService(leads, follow_ups, campaigns),
         ai_usage=ai_usage,
+        drafts=drafts,
+        draft_service=DraftService(leads, drafts, ai, ai_usage),
+        import_batches=import_batches,
     )
 
     @asynccontextmanager

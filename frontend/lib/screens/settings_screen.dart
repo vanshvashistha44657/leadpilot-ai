@@ -24,13 +24,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _senderEmail = TextEditingController();
   final _physicalAddress = TextEditingController();
   final _unsubscribeUrl = TextEditingController();
+  final _aiProvider = TextEditingController();
+  final _aiModel = TextEditingController();
+  final _aiBaseUrl = TextEditingController();
+  final _aiTimeout = TextEditingController();
+  final _aiRetries = TextEditingController();
+  final _aiBackoff = TextEditingController();
   bool _hydrated = false;
+  bool _aiHydrated = false;
   bool _addressPlaceholder = false;
   bool _unsubscribePlaceholder = false;
   bool _dryRun = true;
   bool _compliance = false;
   String _provider = 'mock';
   bool _busy = false;
+  AIConnectivityResult? _aiConnectivity;
 
   @override
   void initState() {
@@ -42,7 +50,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
-    for (final controller in [_baseUrl, _token, _senderName, _senderEmail, _physicalAddress, _unsubscribeUrl]) {
+    for (final controller in [_baseUrl, _token, _senderName, _senderEmail, _physicalAddress, _unsubscribeUrl, _aiProvider, _aiModel, _aiBaseUrl, _aiTimeout, _aiRetries, _aiBackoff]) {
       controller.dispose();
     }
     super.dispose();
@@ -53,12 +61,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       widget.api.getSettings(),
       widget.api.listProviders(),
       widget.api.getAIStatus(),
+      widget.api.getAIConfig(),
+      widget.api.getAIUsage(),
       widget.api.getGmailStatus(),
     ]);
     final settings = results[0] as PublicSettings;
     final providers = results[1] as List<ProviderStatus>;
     final aiStatus = results[2] as AIProviderStatus;
-    final gmailStatus = results[3] as GmailStatus;
+    final aiConfig = results[3] as AIProviderConfig;
+    final aiUsage = results[4] as AIUsageSummary;
+    final gmailStatus = results[5] as GmailStatus;
     HealthResponse? health;
     String? healthError;
     try {
@@ -66,7 +78,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (error) {
       healthError = error.toString();
     }
-    return _SettingsData(settings, providers, health, healthError, aiStatus, gmailStatus);
+    return _SettingsData(settings, providers, health, healthError, aiStatus, aiConfig, aiUsage, gmailStatus);
   }
 
   void _hydrate(PublicSettings settings) {
@@ -83,8 +95,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _provider = settings.provider;
   }
 
+  void _hydrateAI(AIProviderConfig config) {
+    if (_aiHydrated) return;
+    _aiHydrated = true;
+    _aiProvider.text = config.provider;
+    _aiModel.text = config.model ?? '';
+    _aiBaseUrl.text = config.baseUrl ?? '';
+    _aiTimeout.text = config.timeoutSeconds.toString();
+    _aiRetries.text = config.maxRetries.toString();
+    _aiBackoff.text = config.retryBackoffSeconds.toString();
+  }
+
   void _refresh() => setState(() {
         _hydrated = false;
+        _aiHydrated = false;
+        _aiConnectivity = null;
         _data = _load();
       });
 
@@ -141,6 +166,47 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _saveAIConfig() async {
+    final timeout = double.tryParse(_aiTimeout.text.trim());
+    final retries = int.tryParse(_aiRetries.text.trim());
+    final backoff = double.tryParse(_aiBackoff.text.trim());
+    if (timeout == null || retries == null || backoff == null) {
+      _showMessage('AI timeout, retries, and backoff must be valid numbers.');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await widget.api.updateAIConfig({
+        'provider': _aiProvider.text.trim(),
+        'model': _aiModel.text.trim(),
+        'base_url': _aiBaseUrl.text.trim(),
+        'timeout_seconds': timeout,
+        'max_retries': retries,
+        'retry_backoff_seconds': backoff,
+      });
+      if (mounted) {
+        _showMessage('AI provider settings saved. The API key remains environment-only.');
+        _refresh();
+      }
+    } catch (error) {
+      if (mounted) _showMessage(error.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _testAIConnectivity() async {
+    setState(() => _busy = true);
+    try {
+      final result = await widget.api.checkAIConnectivity();
+      if (mounted) setState(() => _aiConnectivity = result);
+    } catch (error) {
+      if (mounted) _showMessage(error.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   Future<void> _setAutomationPaused(bool paused) async {
     setState(() => _busy = true);
     try {
@@ -181,6 +247,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               final data = snapshot.data;
               if (data == null) return ErrorState(message: 'The backend returned no settings.', onRetry: _refresh);
               _hydrate(data.settings);
+              _hydrateAI(data.aiConfig);
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -203,7 +270,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onAutomationChanged: _setAutomationPaused,
                   ),
                   const SizedBox(height: 20),
-                  _SenderCard(
+                   _SenderCard(
                     senderName: _senderName,
                     senderEmail: _senderEmail,
                     physicalAddress: _physicalAddress,
@@ -213,9 +280,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onProviderChanged: (value) {
                       if (value != null) setState(() => _provider = value);
                     },
-                  ),
-                  const SizedBox(height: 20),
-                  _IntegrationStatusCard(aiStatus: data.aiStatus, gmailStatus: data.gmailStatus),
+                   ),
+                   const SizedBox(height: 20),
+                   _AIConfigurationCard(
+                     status: data.aiStatus,
+                     config: data.aiConfig,
+                     usage: data.aiUsage,
+                     connectivity: _aiConnectivity,
+                     provider: _aiProvider,
+                     model: _aiModel,
+                     baseUrl: _aiBaseUrl,
+                     timeout: _aiTimeout,
+                     retries: _aiRetries,
+                     backoff: _aiBackoff,
+                     busy: _busy,
+                     onSave: _saveAIConfig,
+                     onTest: _testAIConnectivity,
+                   ),
+                   const SizedBox(height: 20),
+                   _IntegrationStatusCard(aiStatus: data.aiStatus, gmailStatus: data.gmailStatus),
                   const SizedBox(height: 20),
                   _AppearanceCard(isDark: widget.isDark, onToggleTheme: widget.onToggleTheme),
                   const SizedBox(height: 20),
@@ -260,13 +343,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
 }
 
 class _SettingsData {
-  const _SettingsData(this.settings, this.providers, this.health, this.healthError, this.aiStatus, this.gmailStatus);
+  const _SettingsData(this.settings, this.providers, this.health, this.healthError, this.aiStatus, this.aiConfig, this.aiUsage, this.gmailStatus);
 
   final PublicSettings settings;
   final List<ProviderStatus> providers;
   final HealthResponse? health;
   final String? healthError;
   final AIProviderStatus aiStatus;
+  final AIProviderConfig aiConfig;
+  final AIUsageSummary aiUsage;
   final GmailStatus gmailStatus;
 }
 
@@ -312,6 +397,113 @@ class _SenderCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => AppCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const SectionHeader(title: 'Sender & integrations', subtitle: 'Provider status is read from the real backend registry; no integration is marked successful locally.'), const SizedBox(height: 18), Row(children: [Expanded(child: TextField(controller: senderName, decoration: const InputDecoration(labelText: 'Sender name'))), const SizedBox(width: 12), Expanded(child: TextField(controller: senderEmail, decoration: const InputDecoration(labelText: 'Sender email')))]), const SizedBox(height: 12), TextField(controller: physicalAddress, minLines: 2, maxLines: 3, decoration: const InputDecoration(labelText: 'Physical address', alignLabelWithHint: true)), const SizedBox(height: 12), TextField(controller: unsubscribeUrl, decoration: const InputDecoration(labelText: 'Unsubscribe URL')), const SizedBox(height: 12), DropdownButtonFormField<String>(initialValue: providers.any((item) => item.name == provider) ? provider : null, decoration: const InputDecoration(labelText: 'Selected provider'), items: providers.map((item) => DropdownMenuItem(value: item.name, child: Text(item.name))).toList(), onChanged: onProviderChanged), const SizedBox(height: 18), if (providers.isEmpty) const Text('No provider statuses returned.', style: TextStyle(color: AppColors.slate)) else Wrap(spacing: 10, runSpacing: 10, children: providers.map((item) => StatusPill(label: '${item.name}: ${item.configured ? 'configured' : 'not configured'}', color: item.configured ? AppColors.mint : AppColors.slate)).toList())]));
+}
+
+class _AIConfigurationCard extends StatelessWidget {
+  const _AIConfigurationCard({
+    required this.status,
+    required this.config,
+    required this.usage,
+    required this.connectivity,
+    required this.provider,
+    required this.model,
+    required this.baseUrl,
+    required this.timeout,
+    required this.retries,
+    required this.backoff,
+    required this.busy,
+    required this.onSave,
+    required this.onTest,
+  });
+
+  final AIProviderStatus status;
+  final AIProviderConfig config;
+  final AIUsageSummary usage;
+  final AIConnectivityResult? connectivity;
+  final TextEditingController provider;
+  final TextEditingController model;
+  final TextEditingController baseUrl;
+  final TextEditingController timeout;
+  final TextEditingController retries;
+  final TextEditingController backoff;
+  final bool busy;
+  final VoidCallback onSave;
+  final VoidCallback onTest;
+
+  Color _connectivityColor() {
+    switch (connectivity?.status) {
+      case 'connected':
+        return AppColors.mint;
+      case 'not_configured':
+      case 'invalid_configuration':
+        return AppColors.amber;
+      default:
+        return AppColors.red;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AppCard(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const SectionHeader(
+            title: 'AI provider configuration',
+            subtitle: 'Configure non-secret OpenAI-compatible settings here. The API key is read only from the backend process environment and is never displayed or stored in SQLite.',
+          ),
+          const SizedBox(height: 16),
+          Wrap(spacing: 10, runSpacing: 10, children: [
+            StatusPill(label: 'Provider: ${status.name}', color: status.configured ? AppColors.mint : AppColors.amber),
+            StatusPill(label: status.apiKeyConfigured ? 'API key configured' : 'API key missing', color: status.apiKeyConfigured ? AppColors.mint : AppColors.amber),
+            StatusPill(label: 'Model: ${config.model ?? 'not set'}', color: AppColors.slate),
+          ]),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: TextField(controller: provider, decoration: const InputDecoration(labelText: 'Provider label', helperText: 'Any label using the OpenAI-compatible adapter'))),
+            const SizedBox(width: 12),
+            Expanded(child: TextField(controller: model, decoration: const InputDecoration(labelText: 'Model'))),
+          ]),
+          const SizedBox(height: 12),
+          TextField(controller: baseUrl, decoration: const InputDecoration(labelText: 'Provider base URL', helperText: 'For example, https://api.openai.com/v1')),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: TextField(controller: timeout, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Timeout seconds'))),
+            const SizedBox(width: 12),
+            Expanded(child: TextField(controller: retries, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Max retries'))),
+            const SizedBox(width: 12),
+            Expanded(child: TextField(controller: backoff, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Retry backoff seconds'))),
+          ]),
+          if (config.configurationErrors.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Text(config.configurationErrors.join(' · '), style: const TextStyle(color: AppColors.red, fontSize: 12)),
+          ],
+          const SizedBox(height: 14),
+          Row(children: [
+            OutlinedButton.icon(onPressed: busy ? null : onSave, icon: const Icon(Icons.save_outlined), label: const Text('Save AI settings')),
+            const SizedBox(width: 10),
+            ElevatedButton.icon(onPressed: busy ? null : onTest, icon: const Icon(Icons.network_check_outlined), label: const Text('Test connectivity')),
+          ]),
+          const SizedBox(height: 14),
+          if (connectivity != null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(color: Theme.of(context).scaffoldBackgroundColor, borderRadius: BorderRadius.circular(12)),
+              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Icon(connectivity!.status == 'connected' ? Icons.check_circle_outline : Icons.error_outline, color: _connectivityColor()),
+                const SizedBox(width: 10),
+                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  StatusPill(label: connectivity!.status.replaceAll('_', ' '), color: _connectivityColor()),
+                  const SizedBox(height: 6),
+                  Text(connectivity!.detail, style: const TextStyle(color: AppColors.slate, fontSize: 12)),
+                  const SizedBox(height: 4),
+                  Text('Checked ${connectivity!.checkedAt.toLocal()}', style: const TextStyle(color: AppColors.slate, fontSize: 11)),
+                ])),
+              ]),
+            ),
+          const SizedBox(height: 12),
+          Text('Usage: ${usage.requests} requests · ${usage.totalTokens} tokens · ${usage.estimatedCostUsd.toStringAsFixed(4)} USD', style: const TextStyle(color: AppColors.slate, fontSize: 12)),
+          if (config.baseUrl != null) Text('Active base URL: ${config.baseUrl}', style: const TextStyle(color: AppColors.slate, fontSize: 12)),
+        ]),
+      );
 }
 
 class _IntegrationStatusCard extends StatelessWidget {
