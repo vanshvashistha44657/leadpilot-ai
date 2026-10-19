@@ -132,7 +132,7 @@ The app reads the API URL and local token from the process environment and keeps
 
 ## Provider configuration
 
-The mock provider is the only provider that is usable by default, and it never sends. Gmail Phase 3 is draft-only: it never calls Gmail send endpoints. It uses the exact loopback redirect `http://127.0.0.1:8000/api/gmail/oauth/callback`, server-generated one-time state, and PKCE S256. The OAuth callback is browser-reachable without `X-Local-Token` only from localhost; every other route remains token-protected. Microsoft Graph remains a non-live configuration stub. Do not treat environment-variable presence as proof of a working provider.
+The mock provider is the only provider that is usable by default, and it never sends. Gmail Phase 3 is draft-only: it never calls Gmail send endpoints. It uses a server-generated one-time state, PKCE S256, and a fresh Desktop-app loopback redirect `http://127.0.0.1:<runtime-port>` for each authorization attempt. The browser callback is handled by that dedicated listener; every FastAPI `/api` route remains token-protected. Microsoft Graph remains a non-live configuration stub. Do not treat environment-variable presence as proof of a working provider.
 
 Before any live campaign, independently verify:
 
@@ -167,7 +167,7 @@ Secrets belong in a local secret manager or environment configuration, never in 
 - `POST /api/ai/personalization/preview`, `POST /api/ai/reply-classification/preview`, `POST /api/ai/brief/preview`
 - `GET /api/gmail/status`, `GET /api/gmail/health`, `GET /api/gmail/auth-url`
 - `POST /api/gmail/drafts/reviewed` (and compatibility path `POST /api/gmail/drafts`) accepts only a local reviewed draft ID; `POST /api/drafts/{id}/gmail` is an equivalent explicit route. It creates a Gmail draft once, records safe provider IDs, and never sends or overwrites a provider draft.
-- `POST /api/gmail/sync` paginates permitted thread metadata/body retrieval, deduplicates provider message IDs, records exact lead matches or unknown/ambiguous outcomes, and uses an incremental history cursor with full-resync fallback when Gmail expires it. `POST /api/gmail/disconnect` revokes when possible and deletes local token material. The browser callback `GET /api/gmail/oauth/callback` is localhost-only and is the sole unauthenticated `/api` route.
+- `POST /api/gmail/sync` paginates permitted thread metadata/body retrieval, deduplicates provider message IDs, records exact lead matches or unknown/ambiguous outcomes, and uses an incremental history cursor with full-resync fallback when Gmail expires it. `POST /api/gmail/disconnect` revokes when possible and deletes local token material. `GET /api/gmail/auth-url` starts a single dedicated loopback listener; the former FastAPI callback path is an authenticated rejection and does not accept OAuth values.
 - `GET/POST /api/packages`, `POST /api/packages/recommend`, `POST /api/packages/{id}/profit`
 - `GET/POST/PATCH /api/proposals`, `/api/payments`, `/api/renewals`
 - `POST/GET /api/follow-ups/queue`, `/api/follow-ups`
@@ -258,11 +258,14 @@ creation, and outreach preview.
 
 ### Phase 3 Gmail setup, scopes, and token storage
 
-Set the OAuth client ID/secret and sender identity in the backend process
-environment. Register exactly `http://127.0.0.1:8000/api/gmail/oauth/callback`
-with Google. `GET /api/gmail/auth-url` generates the state and PKCE verifier on
-the server; a caller-supplied `state` query value is ignored. Google receives
-the minimum Phase 3 scopes:
+Create a **Desktop app** OAuth client in Google Cloud, then set its client ID and
+sender identity in the backend process environment. A client secret is optional
+for this loopback Desktop flow. Do not set a fixed `GMAIL_REDIRECT_URI`: each
+authenticated `GET /api/gmail/auth-url` binds an available port on
+`127.0.0.1`, returns a Google URL containing exactly
+`http://127.0.0.1:<runtime-port>`, and uses that same URI in the token exchange.
+The server generates the state and PKCE verifier; a caller-supplied `state`
+query value is ignored. Google receives the minimum Phase 3 scopes:
 
 ```text
 https://www.googleapis.com/auth/gmail.compose
@@ -277,11 +280,14 @@ fallback and fails closed if DPAPI is unavailable. Tokens are never stored in
 SQLite, ordinary settings, API models, logs, or audit details. Tests may inject
 an in-memory token store; production uses the DPAPI store.
 
-The OAuth callback is the only unauthenticated `/api` route. Middleware still
-requires it to arrive from localhost/loopback; all other API routes require
-`X-Local-Token`. Callback errors are deliberately generic. Disconnect attempts
-Google credential revocation and securely deletes local token material even when
-remote revocation is unavailable.
+The dedicated callback listener accepts only its exact root path on
+`127.0.0.1`, validates the one-time expiring state and PKCE verifier, and
+closes after completion, denial, expiry, or an invalid callback. Callback
+responses are deliberately generic. Both required scopes must be present in the
+token response and an authorization-code exchange must return a usable refresh
+token before credentials are stored. Disconnect attempts Google credential
+revocation and securely deletes local token material even when remote
+revocation is unavailable.
 
 The Settings screen exposes explicit Connect, Verify, and Disconnect controls;
 authorization alone is shown as pending until the profile health check succeeds.
@@ -422,11 +428,11 @@ The local queue is process-local with persisted job state. It is suitable for a 
 From `backend/`:
 
 ```text
-python -m pytest                 72 passed, 1 dependency deprecation warning
+python -m pytest                 86 passed, 1 dependency deprecation warning
 python -m compileall -q app tests passed
 ```
 
-An actual backend server smoke check also passed: readiness returned `ready`, database `ok`, migration `4`, and an unauthenticated dashboard request returned `401`. The synthetic smoke workflow also created a lead, rendered a dry-run preview, completed a background job, and read back lead history.
+An actual backend server smoke check also passed: readiness returned `ready`, database `ok`, migration `6`, and an unauthenticated dashboard request returned `401`. The synthetic smoke workflow also created a lead, rendered a dry-run preview, completed a background job, and read back lead history.
 
 Flutter toolchain status:
 
@@ -435,16 +441,15 @@ Flutter 3.47.7 at C:\src\flutter: verified
 Dart 3.13.5: verified
 flutter pub get: passed
 flutter analyze: passed with no issues
-flutter test: passed (3 tests)
+flutter test: passed (18 tests)
 flutter build windows --release: passed
 ```
 
 The frontend is dependency-light and source-complete. macOS builds remain
 untested. The Windows package staging check is also verified locally with
-Python 3.12.10 and the generated release executable. Inno Setup 6.7.1 also
-compiled `dist\LeadPilot-Setup.exe`, and the installer lifecycle verifier
-passed install, launcher authentication, frontend launch, upgrade, backend
-shutdown, uninstall, and persistent-data preservation locally.
+Python 3.12.10 and the generated release executable. Installer compilation
+and lifecycle verification require Inno Setup; `ISCC.exe` was not available in
+this workspace and therefore remain for GitHub Actions.
 
 ## Private GitHub CI
 
@@ -463,9 +468,8 @@ GitHub-hosted Windows jobs and does not require project secrets:
 The installer job installs Inno Setup automatically on `windows-latest`; local
 backend and Flutter tests do not require Inno Setup.
 
-The latest completed workflow for commit `8fa90a7` passed the original backend
-and Flutter checks. The Phase 2 installer job has not run against this working
-tree until the changes are pushed to GitHub.
+The Phase 3 Desktop OAuth changes have not been pushed, so GitHub Actions has
+not run against this working tree.
 
 ### Repository state
 

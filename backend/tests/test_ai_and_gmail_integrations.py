@@ -67,7 +67,7 @@ def gmail_config(**overrides) -> GmailConfig:
         "client_id": "test-client-id",
         "client_secret": "test-client-secret",
         "refresh_token": "test-refresh-token",
-        "redirect_uri": "http://127.0.0.1:8000/api/gmail/oauth/callback",
+        "redirect_uri": "http://127.0.0.1:49152",
         "sender_email": "sender@example.test",
         "token_path": Path("C:/outside-repo/gmail-tokens.json"),
         "retry_backoff_seconds": 0,
@@ -313,7 +313,7 @@ def test_ai_config_update_persists_non_secret_settings_and_connectivity_usage(cl
 def test_gmail_authorization_url_uses_official_endpoint_and_no_network():
     adapter = GmailApiAdapter(gmail_config(), transport=FakeTransport([]), token_store=MemoryTokenStore())
 
-    authorization_url = adapter.authorization_url("state-value")
+    authorization_url = adapter.authorization_url("state-value", code_challenge="c" * 43)
     parsed = urlparse(authorization_url)
     query = parse_qs(parsed.query)
     assert parsed.scheme == "https"
@@ -321,6 +321,15 @@ def test_gmail_authorization_url_uses_official_endpoint_and_no_network():
     assert parsed.path == "/o/oauth2/v2/auth"
     assert query["client_id"] == ["test-client-id"]
     assert query["state"] == ["state-value"]
+    assert query["code_challenge"] == ["c" * 43]
+    assert query["code_challenge_method"] == ["S256"]
+
+
+def test_gmail_authorization_url_rejects_missing_pkce_challenge():
+    adapter = GmailApiAdapter(gmail_config(), transport=FakeTransport([]), token_store=MemoryTokenStore())
+
+    with pytest.raises(ValueError, match="PKCE challenge"):
+        adapter.authorization_url("state-value")
 
 
 def test_gmail_oauth_exchange_stores_tokens_without_exposing_token_result():
@@ -328,7 +337,7 @@ def test_gmail_oauth_exchange_stores_tokens_without_exposing_token_result():
     transport = FakeTransport([response({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600, "scope": "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"})])
     adapter = GmailApiAdapter(gmail_config(), transport=transport, token_store=store)
 
-    result = adapter.exchange_code("authorization-code")
+    result = adapter.exchange_code("authorization-code", code_verifier="v" * 64)
 
     assert result.has_refresh_token is True
     assert store.token is not None
@@ -339,7 +348,7 @@ def test_gmail_oauth_exchange_stores_tokens_without_exposing_token_result():
 
 
 def test_gmail_refresh_uses_stored_refresh_token_and_replaces_access_token():
-    store = MemoryTokenStore(GmailToken(access_token="expired", refresh_token="stored-refresh", expires_at=0))
+    store = MemoryTokenStore(GmailToken(access_token="expired", refresh_token="stored-refresh", expires_at=0, scope="https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"))
     transport = FakeTransport([response({"access_token": "new-access", "expires_in": 1800})])
     adapter = GmailApiAdapter(gmail_config(refresh_token=""), transport=transport, token_store=store)
 
@@ -352,7 +361,7 @@ def test_gmail_refresh_uses_stored_refresh_token_and_replaces_access_token():
 
 
 def test_gmail_send_is_blocked_before_http_until_explicit_approval():
-    store = MemoryTokenStore(GmailToken(access_token="access", refresh_token="refresh", expires_at=None))
+    store = MemoryTokenStore(GmailToken(access_token="access", refresh_token="refresh", expires_at=None, scope="https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"))
     transport = FakeTransport([])
     adapter = GmailApiAdapter(gmail_config(), transport=transport, token_store=store)
 
@@ -363,7 +372,7 @@ def test_gmail_send_is_blocked_before_http_until_explicit_approval():
 
 
 def test_gmail_profile_draft_and_thread_sync_use_typed_offline_transport():
-    store = MemoryTokenStore(GmailToken(access_token="access", refresh_token="refresh", expires_at=None))
+    store = MemoryTokenStore(GmailToken(access_token="access", refresh_token="refresh", expires_at=None, scope="https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"))
     transport = FakeTransport(
         [
             response({"emailAddress": "sender@example.test", "messagesTotal": 4, "threadsTotal": 2}),
@@ -417,13 +426,14 @@ def test_gmail_service_requires_registered_oauth_state_and_stores_exchange_token
     monkeypatch.setenv("GMAIL_CLIENT_SECRET", "secret")
     monkeypatch.setenv("GMAIL_SENDER_EMAIL", "sender@example.test")
     store = MemoryTokenStore()
-    transport = FakeTransport([response({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600})])
+    transport = FakeTransport([response({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600, "scope": "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"})])
     service = GmailService(transport=transport, token_store_factory=lambda _: store)
 
-    service.authorization_url("state-1")
-    status = service.exchange_code("code-1", "state-1")
+    authorization_url = service.authorization_url("caller-state")
+    state = parse_qs(urlparse(authorization_url).query)["state"][0]
+    status = service.exchange_code("code-1", state)
 
     assert status.token_available is True
     assert store.token is not None
     with pytest.raises(GmailUnavailableError, match="missing or expired"):
-        service.exchange_code("code-2", "state-1")
+        service.exchange_code("code-2", state)

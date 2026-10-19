@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import parse_qs, urlparse
+import socket
+from concurrent.futures import ThreadPoolExecutor
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import urlopen
 
 import pytest
 
@@ -9,6 +13,7 @@ from app.services.gmail import (
     GmailApiAdapter,
     GmailApiError,
     GmailConfig,
+    GMAIL_COMPOSE_SCOPE,
     GmailDraft,
     GmailMessage,
     GmailSyncedMessage,
@@ -100,13 +105,41 @@ def response(payload: dict, status_code: int = 200) -> HttpResponse:
     return HttpResponse(status_code=status_code, headers={}, body=json.dumps(payload).encode())
 
 
-def test_oauth_route_generates_state_and_pkce_and_callback_is_public(client, monkeypatch):
+GMAIL_SCOPE_RESPONSE = "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"
+
+
+def _callback_url(auth_response, **params):
+    auth_values = parse_qs(urlparse(auth_response.json()["authorization_url"]).query)
+    redirect_uri = auth_values["redirect_uri"][0]
+    query = {"state": auth_values["state"][0], **params}
+    return f"{redirect_uri}?{urlencode(query)}"
+
+
+def _listener_port(auth_response) -> int:
+    redirect_uri = parse_qs(urlparse(auth_response.json()["authorization_url"]).query)["redirect_uri"][0]
+    parsed = urlparse(redirect_uri)
+    assert parsed.scheme == "http"
+    assert parsed.hostname == "127.0.0.1"
+    assert parsed.path == ""
+    assert parsed.port is not None and parsed.port > 0
+    return parsed.port
+
+
+def _assert_listener_closed(port: int) -> None:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            raise AssertionError("OAuth listener is still accepting connections")
+    except OSError:
+        return
+
+
+def test_oauth_route_generates_dynamic_loopback_pkce_and_cleans_listener(client, monkeypatch):
     monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
-    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "client-secret")
+    monkeypatch.delenv("GMAIL_CLIENT_SECRET", raising=False)
     monkeypatch.setenv("GMAIL_SENDER_EMAIL", "sender@example.test")
     store = MemoryTokenStore()
     transport = FakeTransport([
-        response({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600}),
+        response({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600, "scope": GMAIL_SCOPE_RESPONSE}),
         response({"emailAddress": "sender@example.test"}),
     ])
     client.app.state.services.gmail.transport = transport
@@ -117,45 +150,193 @@ def test_oauth_route_generates_state_and_pkce_and_callback_is_public(client, mon
     values = parse_qs(urlparse(auth.json()["authorization_url"]).query)
     assert auth.json()["state"] != "caller-state"
     assert values["state"] == [auth.json()["state"]]
+    assert values["redirect_uri"][0].startswith("http://127.0.0.1:")
+    assert urlparse(values["redirect_uri"][0]).path == ""
     assert values["code_challenge_method"] == ["S256"]
     assert values["scope"] == ["https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"]
 
-    callback = client.get(f"/api/gmail/oauth/callback?code=authorization-code&state={auth.json()['state']}")
-    assert callback.status_code == 200
-    assert "access" not in callback.text
-    assert "refresh" not in callback.text
-    assert b"code_verifier" in transport.calls[0]["body"]
+    callback = urlopen(_callback_url(auth, code="authorization-code"), timeout=2)
+    assert callback.status == 200
+    callback_body = callback.read().decode()
+    assert "access" not in callback_body
+    assert "refresh" not in callback_body
+    token_request = parse_qs(transport.calls[0]["body"].decode())
+    assert token_request["redirect_uri"] == values["redirect_uri"]
+    assert token_request["code_verifier"]
+    import base64
+    import hashlib
 
-    replay = client.get(f"/api/gmail/oauth/callback?code=authorization-code&state={auth.json()['state']}")
-    assert replay.status_code == 400
-    assert replay.json()["detail"] == "Gmail OAuth callback failed"
+    expected_challenge = base64.urlsafe_b64encode(hashlib.sha256(token_request["code_verifier"][0].encode()).digest()).decode().rstrip("=")
+    assert expected_challenge == values["code_challenge"][0]
+    _assert_listener_closed(_listener_port(auth))
     assert client.get("/api/dashboard/metrics").status_code == 401
 
 
-def test_callback_errors_are_sanitized_and_invalid_redirect_is_rejected(client, monkeypatch):
+def test_legacy_fastapi_callback_is_authenticated_and_rejects_old_contract(client, monkeypatch):
     monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
-    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "client-secret")
-    monkeypatch.setenv("GMAIL_REDIRECT_URI", "http://localhost:8000/api/gmail/oauth/callback")
     result = client.get(
         "/api/gmail/oauth/callback",
         params={"code": "secret-code-value", "state": "attacker-state"},
     )
-    assert result.status_code == 400
-    assert "secret-code-value" not in result.text
-    assert "attacker-state" not in result.text
-
-
-def test_oauth_consent_denial_is_handled_without_provider_details(client):
-    result = client.get(
+    assert result.status_code == 401
+    rejected = client.get(
         "/api/gmail/oauth/callback",
-        params={"error": "access_denied", "state": "state-value"},
+        headers={"X-Local-Token": "test-token"},
+        params={"code": "secret-code-value", "state": "attacker-state"},
     )
-    assert result.status_code == 400
-    assert result.json()["detail"] == "Gmail authorization was denied"
+    assert rejected.status_code == 410
+    assert "secret-code-value" not in rejected.text
+    assert "attacker-state" not in rejected.text
+
+
+def test_oauth_consent_denial_is_handled_without_provider_details(client, monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    store = MemoryTokenStore()
+    transport = FakeTransport([])
+    client.app.state.services.gmail.transport = transport
+    client.app.state.services.gmail.token_store_factory = lambda _: store
+    auth = client.get("/api/gmail/auth-url", headers={"X-Local-Token": "test-token"})
+    denied = urlopen(_callback_url(auth, error="access_denied"), timeout=2)
+    assert denied.status == 200
+    body = denied.read().decode()
+    assert "access_denied" not in body
+    assert "state" not in body
+    assert transport.calls == []
+    _assert_listener_closed(_listener_port(auth))
+
+
+def test_invalid_loopback_callback_is_generic_and_closes_the_bound_listener(monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    store = MemoryTokenStore()
+    transport = FakeTransport([])
+    from app.services.gmail import GmailService
+
+    service = GmailService(transport=transport, token_store_factory=lambda _: store)
+    authorization_url = service.authorization_url()
+    values = parse_qs(urlparse(authorization_url).query)
+    port = urlparse(values["redirect_uri"][0]).port
+    assert port is not None
+    assert service._oauth_attempt is not None
+    assert service._oauth_attempt.server.server_address[0] == "127.0.0.1"
+
+    try:
+        with pytest.raises(HTTPError) as error:
+            urlopen(f"{values['redirect_uri'][0]}/wrong-root?code=secret&state=attacker", timeout=2)
+        assert error.value.code == 404
+        body = error.value.read().decode()
+        assert "secret" not in body
+        assert "attacker" not in body
+        _assert_listener_closed(port)
+        assert transport.calls == []
+        assert service._oauth_attempt is None
+    finally:
+        service.close()
+
+
+def test_state_expiry_and_replay_are_single_use(monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    from app.services.gmail import GmailService
+
+    expired_service = GmailService(transport=FakeTransport([]), token_store_factory=lambda _: MemoryTokenStore())
+    expired_url = expired_service.authorization_url()
+    expired_state = parse_qs(urlparse(expired_url).query)["state"][0]
+    attempt = expired_service._oauth_attempt
+    assert attempt is not None
+    expired_service._oauth_states[expired_state] = (0.0, attempt.verifier)
+    expired_service._prune_oauth_states()
+    with pytest.raises(GmailUnavailableError, match="missing or expired"):
+        expired_service.exchange_code("code", expired_state)
+    assert expired_service._oauth_attempt is None
+
+    store = MemoryTokenStore()
+    transport = FakeTransport([response({"access_token": "access", "refresh_token": "refresh", "scope": GMAIL_SCOPE_RESPONSE})])
+    service = GmailService(transport=transport, token_store_factory=lambda _: store)
+    try:
+        authorization_url = service.authorization_url()
+        state = parse_qs(urlparse(authorization_url).query)["state"][0]
+        service.exchange_code("code", state)
+        with pytest.raises(GmailUnavailableError, match="missing or expired"):
+            service.exchange_code("replay", state)
+        assert len(transport.calls) == 1
+    finally:
+        expired_service.close()
+        service.close()
+
+
+def test_new_authorization_attempt_replaces_and_closes_previous_listener(monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    from app.services.gmail import GmailService
+
+    service = GmailService(transport=FakeTransport([]), token_store_factory=lambda _: MemoryTokenStore())
+    try:
+        first = service.authorization_url()
+        first_port = urlparse(parse_qs(urlparse(first).query)["redirect_uri"][0]).port
+        second = service.authorization_url()
+        second_port = urlparse(parse_qs(urlparse(second).query)["redirect_uri"][0]).port
+        assert first_port is not None and second_port is not None
+        assert first_port != second_port
+        _assert_listener_closed(first_port)
+        assert service._oauth_attempt is not None
+        assert service._oauth_attempt.redirect_uri.endswith(str(second_port))
+    finally:
+        service.close()
+
+
+def test_concurrent_authorization_requests_leave_only_the_latest_listener(monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    from app.services.gmail import GmailService
+
+    service = GmailService(transport=FakeTransport([]), token_store_factory=lambda _: MemoryTokenStore())
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(service.authorization_url) for _ in range(2)]
+            urls = [future.result() for future in futures]
+        ports = [urlparse(parse_qs(urlparse(url).query)["redirect_uri"][0]).port for url in urls]
+        assert all(port is not None for port in ports)
+        assert len(set(ports)) == 2
+        assert service._oauth_attempt is not None
+        active_port = urlparse(service._oauth_attempt.redirect_uri).port
+        assert active_port in ports
+        _assert_listener_closed(next(port for port in ports if port != active_port))
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"access_token": "access", "refresh_token": "refresh", "scope": "https://www.googleapis.com/auth/gmail.compose"},
+        {"access_token": "access", "scope": GMAIL_SCOPE_RESPONSE},
+    ],
+)
+def test_token_exchange_fails_closed_before_saving_incomplete_offline_credentials(payload):
+    store = MemoryTokenStore()
+    transport = FakeTransport([response(payload)])
+    config = GmailConfig(
+        client_id="client-id",
+        client_secret="",
+        redirect_uri="http://127.0.0.1:49152",
+    )
+    adapter = GmailApiAdapter(config, transport=transport, token_store=store)
+    with pytest.raises(GmailApiError):
+        adapter.exchange_code("code", code_verifier="v" * 64)
+    assert store.token is None
+
+
+def test_incomplete_scope_token_is_not_reported_as_connected():
+    store = MemoryTokenStore(GmailToken("access", "refresh", scope=GMAIL_COMPOSE_SCOPE))
+    config = GmailConfig(
+        client_id="client-id",
+        client_secret="",
+        redirect_uri="http://127.0.0.1:49152",
+    )
+    status = GmailApiAdapter(config, transport=FakeTransport([]), token_store=store).status()
+    assert status.configured is False
+    assert status.supports_live_send is False
 
 
 def test_gmail_health_uses_profile_endpoint_and_returns_safe_status():
-    store = MemoryTokenStore(GmailToken("access", "refresh"))
+    store = MemoryTokenStore(GmailToken("access", "refresh", scope=GMAIL_SCOPE_RESPONSE))
     transport = FakeTransport(
         [response({"emailAddress": "sender@example.test", "messagesTotal": 3, "threadsTotal": 2})]
     )
@@ -180,7 +361,7 @@ def test_gmail_health_uses_profile_endpoint_and_returns_safe_status():
 
 
 def test_gmail_draft_provider_mutation_is_not_retried_after_transient_failure():
-    store = MemoryTokenStore(GmailToken("access", "refresh"))
+    store = MemoryTokenStore(GmailToken("access", "refresh", scope=GMAIL_SCOPE_RESPONSE))
     transport = FakeTransport([response({"error": "temporarily unavailable"}, status_code=503)])
     adapter = GmailApiAdapter(
         GmailConfig(
@@ -201,11 +382,10 @@ def test_gmail_draft_provider_mutation_is_not_retried_after_transient_failure():
     assert len(transport.calls) == 1
 
 
-def test_oauth_callback_is_localhost_only_but_other_routes_need_token(app, monkeypatch):
+def test_oauth_legacy_path_is_not_public_and_other_routes_need_token(app, monkeypatch):
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
-    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "client-secret")
     external = TestClient(app, client=("203.0.113.10", 1234))
     callback = external.get("/api/gmail/oauth/callback", params={"code": "code", "state": "state"})
     assert callback.status_code == 403
@@ -228,6 +408,7 @@ def test_secure_storage_unavailable_fails_closed_without_network_call():
         client_id="client",
         client_secret="secret",
         refresh_token="refresh",
+        redirect_uri="http://127.0.0.1:49152",
         sender_email="sender@example.test",
     )
     transport = FakeTransport([])
@@ -238,7 +419,7 @@ def test_secure_storage_unavailable_fails_closed_without_network_call():
 
 
 def test_refresh_rejected_clears_local_token_and_disconnect_revokes_when_possible():
-    store = MemoryTokenStore(GmailToken("expired", "refresh-token", expires_at=0))
+    store = MemoryTokenStore(GmailToken("expired", "refresh-token", expires_at=0, scope=GMAIL_SCOPE_RESPONSE))
     transport = FakeTransport([response({"error": "invalid_grant"}, status_code=400)])
     config = GmailConfig(client_id="client", client_secret="secret", sender_email="sender@example.test")
     adapter = GmailApiAdapter(config, transport=transport, token_store=store)
@@ -246,12 +427,34 @@ def test_refresh_rejected_clears_local_token_and_disconnect_revokes_when_possibl
         adapter.refresh_access_token()
     assert store.token is None
 
-    store = MemoryTokenStore(GmailToken("access", "refresh-token"))
+    store = MemoryTokenStore(GmailToken("access", "refresh-token", scope=GMAIL_SCOPE_RESPONSE))
     revoke_transport = FakeTransport([response({})])
     adapter = GmailApiAdapter(config, transport=revoke_transport, token_store=store)
     assert adapter.revoke_credentials() is True
     assert store.token is None
     assert revoke_transport.calls[0]["url"] == "https://oauth2.googleapis.com/revoke"
+
+
+def test_client_secret_is_optional_and_conditionally_sent_to_token_and_revoke():
+    no_secret_store = MemoryTokenStore()
+    no_secret_transport = FakeTransport([response({"access_token": "access", "refresh_token": "refresh", "scope": GMAIL_SCOPE_RESPONSE})])
+    no_secret_adapter = GmailApiAdapter(
+        GmailConfig(client_id="client", client_secret="", redirect_uri="http://127.0.0.1:49152"),
+        transport=no_secret_transport,
+        token_store=no_secret_store,
+    )
+    no_secret_adapter.exchange_code("code", code_verifier="v" * 64)
+    assert "client_secret" not in parse_qs(no_secret_transport.calls[0]["body"].decode())
+
+    secret_store = MemoryTokenStore(GmailToken("access", "refresh", scope=GMAIL_SCOPE_RESPONSE))
+    secret_transport = FakeTransport([response({})])
+    secret_adapter = GmailApiAdapter(
+        GmailConfig(client_id="client", client_secret="secret", redirect_uri="http://127.0.0.1:49152"),
+        transport=secret_transport,
+        token_store=secret_store,
+    )
+    assert secret_adapter.revoke_credentials() is True
+    assert parse_qs(secret_transport.calls[0]["body"].decode())["client_secret"] == ["secret"]
 
 
 def test_dpapi_store_does_not_fallback_to_plaintext_on_non_windows(tmp_path):
@@ -265,9 +468,9 @@ def test_dpapi_store_round_trips_and_deletes_on_windows(tmp_path):
     if __import__("os").name != "nt":
         pytest.skip("Windows DPAPI is only available on Windows")
     store = WindowsDPAPITokenStore(tmp_path / "tokens.bin")
-    store.save(GmailToken("dummy-access", "dummy-refresh", expires_at=123.0))
+    store.save(GmailToken("dummy-access", "dummy-refresh", expires_at=123.0, scope=GMAIL_SCOPE_RESPONSE))
     assert store.path.read_bytes() != b'{"access_token":"dummy-access"}'
-    assert store.load() == GmailToken("dummy-access", "dummy-refresh", expires_at=123.0)
+    assert store.load() == GmailToken("dummy-access", "dummy-refresh", expires_at=123.0, scope=GMAIL_SCOPE_RESPONSE)
     store.delete()
     assert not store.path.exists()
 

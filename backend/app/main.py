@@ -121,6 +121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
+        gmail.close()
         queue.shutdown()
 
     app = FastAPI(

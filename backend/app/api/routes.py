@@ -79,7 +79,7 @@ from ..services.research import score_verified_lead, score_factors
 from ..services.replies import classify_reply
 from ..services.ai import AIProviderError, AIUnavailableError
 from ..services.drafts import DraftRateLimitError, DraftSuppressedError
-from ..services.gmail import GmailApiError, GmailUnavailableError
+from ..services.gmail import DEFAULT_GMAIL_SCOPES, GmailApiError, GmailUnavailableError
 from ..services.gmail_drafts import (
     ReviewedDraftError,
     ReviewedDraftFailedError,
@@ -742,8 +742,9 @@ def synchronize_gmail(payload: GmailSyncRequest, services: ServiceDep) -> GmailS
 def gmail_auth_url(services: ServiceDep, state: str | None = Query(default=None, max_length=500)) -> GmailAuthUrl:
     try:
         # A legacy query value is deliberately ignored: OAuth state authority
-        # is always generated and retained by the server.
-        authorization_url = services.gmail.authorization_url()
+        # is always generated and retained by the server. The service binds a
+        # fresh 127.0.0.1 listener before returning this URL.
+        authorization_url = services.gmail.authorization_url(on_connected=lambda: _record_gmail_connection(services))
     except GmailUnavailableError as exc:
         raise HTTPException(status_code=503, detail="Gmail OAuth is unavailable") from None
     except ValueError as exc:
@@ -752,37 +753,25 @@ def gmail_auth_url(services: ServiceDep, state: str | None = Query(default=None,
     return GmailAuthUrl(authorization_url=authorization_url, state=parsed_state)
 
 
-@router.get("/api/gmail/oauth/callback", response_model=GmailStatus, tags=["gmail"])
-def gmail_oauth_callback(
-    services: ServiceDep,
-    code: str | None = Query(default=None, min_length=1, max_length=5000),
-    state: str = Query(..., min_length=1, max_length=500),
-    error: str | None = Query(default=None, max_length=200),
-) -> GmailStatus:
-    if error is not None:
-        raise HTTPException(status_code=400, detail="Gmail authorization was denied")
-    if not code:
-        raise HTTPException(status_code=400, detail="Gmail OAuth callback is missing an authorization code")
-    try:
-        status = services.gmail.exchange_code(code, state)
-        health = services.gmail.health_check()
-        if health.sender_identity is not None:
-            status = status.model_copy(
-                update={
-                    "sender_email": health.sender_identity.email_address,
-                    "sender_email_configured": True,
-                    "health": health.status,
-                }
-            )
+def _record_gmail_connection(services: Services) -> None:
+    """Record only a verified, scope-complete Gmail connection."""
+    status = services.gmail.public_status()
+    health = services.gmail.health_check() if status.configured else None
+    identity = health.sender_identity if health and health.status == "healthy" else None
+    if status.configured and identity is not None:
+        services.gmail_accounts.upsert(email=identity.email_address, scopes=DEFAULT_GMAIL_SCOPES)
+    else:
         services.gmail_accounts.upsert(
-            email=health.sender_identity.email_address if health.sender_identity else status.sender_email,
-            scopes=("https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.readonly"),
+            scopes=DEFAULT_GMAIL_SCOPES,
+            status="disconnected",
+            last_error="Gmail profile verification failed",
         )
-        return status
-    except (GmailUnavailableError, GmailApiError, ValueError):
-        # Do not reflect provider details, authorization codes, or state in a
-        # browser-visible error response.
-        raise HTTPException(status_code=400, detail="Gmail OAuth callback failed") from None
+
+
+@router.get("/api/gmail/oauth/callback", include_in_schema=False, tags=["gmail"])
+def gmail_oauth_callback_legacy() -> None:
+    """Reject the former FastAPI callback; OAuth now uses the bound listener."""
+    raise HTTPException(status_code=410, detail="Gmail OAuth callback moved to the loopback listener")
 
 
 @router.post("/api/gmail/disconnect", response_model=GmailDisconnectOut, tags=["gmail"])

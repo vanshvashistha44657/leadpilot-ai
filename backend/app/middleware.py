@@ -11,7 +11,7 @@ from starlette.responses import Response
 from .config import Settings
 
 
-PUBLIC_PATHS = {"/health/live", "/health/ready", "/docs", "/redoc", "/openapi.json", "/api/gmail/oauth/callback"}
+PUBLIC_PATHS = {"/health/live", "/health/ready", "/docs", "/redoc", "/openapi.json"}
 
 
 class LocalAuthMiddleware(BaseHTTPMiddleware):
@@ -22,8 +22,7 @@ class LocalAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         host = (request.client.host if request.client else "").lower()
         is_local = host in {"127.0.0.1", "::1", "localhost", "testclient", ""} or host.startswith("127.")
-        callback_path = request.url.path == "/api/gmail/oauth/callback"
-        if (self.settings.local_only or callback_path) and not is_local:
+        if self.settings.local_only and not is_local:
             return JSONResponse(status_code=403, content={"detail": "local access only"})
         if request.url.path not in PUBLIC_PATHS:
             token = request.headers.get("X-Local-Token", "")
