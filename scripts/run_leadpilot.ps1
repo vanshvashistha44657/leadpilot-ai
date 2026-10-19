@@ -195,6 +195,28 @@ function Stop-TestFrontendIfOwned {
   }
 }
 
+function Start-PackagedFrontend {
+  param(
+    [string]$ExecutablePath,
+    [string]$WorkingDirectory,
+    [string]$ShutdownEventName
+  )
+
+  $startParameters = @{
+    FilePath = $ExecutablePath
+    WorkingDirectory = $WorkingDirectory
+    PassThru = $true
+    ErrorAction = "Stop"
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ShutdownEventName)) {
+    # Add ArgumentList only for verifier-created test events. Keeping the key
+    # absent for production launches avoids PowerShell binding an empty array
+    # as a null argument collection.
+    $startParameters.ArgumentList = "--leadpilot-test-shutdown-event=$ShutdownEventName"
+  }
+  return Start-Process @startParameters
+}
+
 function Invoke-ApiCheck {
   param(
     [string]$Uri,
@@ -367,11 +389,7 @@ try {
   if ($LaunchFrontend) {
     $env:LEADPILOT_API_URL = "http://127.0.0.1:$Port"
     $env:LEADPILOT_LOCAL_TOKEN = $LocalToken
-    $frontendArguments = @()
-    if (-not [string]::IsNullOrWhiteSpace($FrontendShutdownEventName)) {
-      $frontendArguments += "--leadpilot-test-shutdown-event=$FrontendShutdownEventName"
-    }
-    $frontendProcess = Start-Process -FilePath $frontendExecutable -ArgumentList $frontendArguments -WorkingDirectory (Split-Path -Parent $frontendExecutable) -PassThru
+    $frontendProcess = Start-PackagedFrontend $frontendExecutable (Split-Path -Parent $frontendExecutable) $FrontendShutdownEventName
     $frontendExecutablePath = [IO.Path]::GetFullPath($frontendExecutable)
     $frontendMetadata = [ordered]@{
       pid = $frontendProcess.Id

@@ -396,15 +396,29 @@ function Invoke-PackagedVerification {
 }
 
 function Invoke-FrontendSmoke {
-  param([string]$InstallDirectory, [string]$DataDirectory, [int]$CheckPort)
+  param(
+    [string]$InstallDirectory,
+    [string]$DataDirectory,
+    [int]$CheckPort,
+    [switch]$UseTestShutdownEvent
+  )
 
   $launcher = Join-Path $InstallDirectory "scripts\run_leadpilot.ps1"
-  $eventName = "Local\LeadPilot-Smoke-$([Guid]::NewGuid().ToString('N'))"
-  $shutdownEvent = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $eventName)
+  $eventName = ""
+  $shutdownEvent = $null
+  if ($UseTestShutdownEvent) {
+    $eventName = "Local\LeadPilot-Smoke-$([Guid]::NewGuid().ToString('N'))"
+    $shutdownEvent = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $eventName)
+  }
   try {
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '" -InstallRoot "' + $InstallDirectory + '" -DataDirectory "' + $DataDirectory + '" -Port ' + $CheckPort + ' -FrontendTimeoutSeconds 120 -FrontendShutdownEventName "' + $eventName + '" -LaunchFrontend'
-    Write-ProgressLog "START frontend smoke on port $CheckPort"
-    Write-ProgressLog "FRONTEND SHUTDOWN EVENT name=$eventName"
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '" -InstallRoot "' + $InstallDirectory + '" -DataDirectory "' + $DataDirectory + '" -Port ' + $CheckPort + ' -FrontendTimeoutSeconds 120 -LaunchFrontend'
+    $smokeMode = "production launcher arguments"
+    if ($UseTestShutdownEvent) {
+      $arguments += ' -FrontendShutdownEventName "' + $eventName + '"'
+      $smokeMode = "test shutdown-event arguments"
+    }
+    Write-ProgressLog "START frontend smoke on port $CheckPort mode=$smokeMode"
+    if ($UseTestShutdownEvent) { Write-ProgressLog "FRONTEND SHUTDOWN EVENT name=$eventName" }
     $launcherProcess = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -PassThru
     $script:ActiveLauncherProcess = $launcherProcess
     $script:ActiveLauncherStart = [DateTimeOffset]$launcherProcess.StartTime.ToUniversalTime()
@@ -463,7 +477,7 @@ function Invoke-FrontendSmoke {
           Write-ProgressLog "FRONTEND WAIT COMPLETE pid=$($frontend.Id) graceful=True method=CloseMainWindow-retry"
         }
       }
-      if (-not $graceful) {
+      if (-not $graceful -and $null -ne $shutdownEvent) {
         Write-ProgressLog "FRONTEND SHUTDOWN REQUEST method=test-event pid=$($frontend.Id)"
         if (-not $shutdownEvent.Set()) {
           throw "Could not signal the frontend's test shutdown event."
@@ -474,6 +488,8 @@ function Invoke-FrontendSmoke {
         } else {
           Stop-ExactFrontendProcess $frontend $expectedExecutable $recordedStart
         }
+      } elseif (-not $graceful) {
+        Stop-ExactFrontendProcess $frontend $expectedExecutable $recordedStart
       }
     }
     Write-ProgressLog "START launcher wait pid=$($launcherProcess.Id)"
@@ -489,7 +505,7 @@ function Invoke-FrontendSmoke {
     $script:ActiveLauncherProcess = $null
     Write-ProgressLog "END frontend smoke on port $CheckPort"
   } finally {
-    $shutdownEvent.Dispose()
+    if ($null -ne $shutdownEvent) { $shutdownEvent.Dispose() }
   }
 }
 
@@ -723,8 +739,11 @@ try {
   Write-ProgressLog "END post-upgrade ownership and persistence assertions"
   Invoke-PackagedVerification $installDirectory ($Port + 2)
 
+  # Regression coverage: first launch uses the production argument contract
+  # with no optional event argument; second launch covers the verifier-only
+  # deterministic shutdown event contract.
   Invoke-FrontendSmoke $installDirectory $userData ($Port + 3)
-  Invoke-FrontendSmoke $installDirectory $userData ($Port + 4)
+  Invoke-FrontendSmoke $installDirectory $userData ($Port + 4) -UseTestShutdownEvent
   Invoke-BackendOnlyStart $installDirectory ($Port + 5)
   Write-ProgressLog "START uninstall while backend is running"
   Invoke-Uninstaller $installDirectory $userData
