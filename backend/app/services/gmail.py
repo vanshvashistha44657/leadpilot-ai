@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import hashlib
+import logging
 import threading
 import html
 import json
@@ -24,6 +25,8 @@ from ..models import GmailHealth, GmailSenderIdentity, GmailStatus, ProviderStat
 from .http_transport import HttpResponse, HttpTransport, UrllibHttpTransport
 from .normalization import normalize_email
 
+
+logger = logging.getLogger(__name__)
 
 GMAIL_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -270,15 +273,20 @@ class WindowsDPAPITokenStore:
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        encrypted = self._crypt(payload, protect=True)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(f".{self.path.name}.tmp")
-        temporary.write_bytes(encrypted)
         try:
-            temporary.chmod(0o600)
-        except OSError:
-            pass
-        temporary.replace(self.path)
+            encrypted = self._crypt(payload, protect=True)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(f".{self.path.name}.tmp")
+            temporary.write_bytes(encrypted)
+            try:
+                temporary.chmod(0o600)
+            except OSError:
+                pass
+            temporary.replace(self.path)
+        except SecureStorageUnavailableError:
+            raise
+        except OSError as exc:
+            raise SecureStorageUnavailableError("stored Gmail credentials could not be saved") from exc
 
     def delete(self) -> None:
         try:
@@ -353,9 +361,10 @@ class GmailUnavailableError(RuntimeError):
 
 
 class GmailApiError(RuntimeError):
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(self, message: str, status_code: int | None = None, category: str = "provider_error"):
         super().__init__(message)
         self.status_code = status_code
+        self.category = category
 
 
 class GmailHistoryExpiredError(GmailApiError):
@@ -364,6 +373,60 @@ class GmailHistoryExpiredError(GmailApiError):
 
 class GmailLiveSendBlocked(RuntimeError):
     pass
+
+
+_SAFE_OAUTH_FAILURE_CATEGORIES = frozenset(
+    {
+        "authorization_code_missing",
+        "callback_origin_rejected",
+        "callback_request_invalid",
+        "gmail_unavailable",
+        "oauth_input_invalid",
+        "oauth_state_invalid",
+        "oauth_token_exchange_rejected",
+        "provider_denied",
+        "provider_error",
+        "provider_http_error",
+        "provider_invalid_json",
+        "provider_invalid_response",
+        "provider_network_error",
+        "secure_storage_unavailable",
+        "token_response_missing_access_token",
+        "token_response_missing_required_scopes",
+        "token_response_missing_refresh_token",
+        "unexpected_callback_failure",
+    }
+)
+
+
+def _oauth_failure_category(exc: BaseException) -> str:
+    if isinstance(exc, GmailApiError):
+        category = exc.category
+        return category if category in _SAFE_OAUTH_FAILURE_CATEGORIES else "provider_error"
+    if isinstance(exc, SecureStorageUnavailableError) or isinstance(exc.__cause__, SecureStorageUnavailableError):
+        return "secure_storage_unavailable"
+    if isinstance(exc, GmailUnavailableError):
+        return "gmail_unavailable"
+    if isinstance(exc, ValueError):
+        return "oauth_input_invalid"
+    return "unexpected_callback_failure"
+
+
+def _log_oauth_callback_failure(
+    category: str,
+    *,
+    exc: BaseException | None = None,
+    status_code: int | None = None,
+) -> None:
+    safe_category = category if category in _SAFE_OAUTH_FAILURE_CATEGORIES else "unexpected_callback_failure"
+    extra: dict[str, Any] = {
+        "error_category": safe_category,
+    }
+    if exc is not None:
+        extra["exception_class"] = type(exc).__name__
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        extra["http_status"] = status_code
+    logger.warning("gmail_oauth_callback_failed", extra=extra)
 
 
 def _error_detail(response: HttpResponse) -> str:
@@ -535,9 +598,9 @@ class GmailApiAdapter:
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise GmailApiError("Gmail returned invalid JSON") from exc
+            raise GmailApiError("Gmail returned invalid JSON", category="provider_invalid_json") from exc
         if not isinstance(payload, dict):
-            raise GmailApiError("Gmail returned an invalid response object")
+            raise GmailApiError("Gmail returned an invalid response object", category="provider_invalid_response")
         return payload
 
     def _request(
@@ -569,7 +632,7 @@ class GmailApiAdapter:
             except (OSError, TimeoutError, URLError) as exc:
                 last_error = exc
                 if attempt >= attempts - 1:
-                    raise GmailApiError("Gmail request failed after retries") from exc
+                    raise GmailApiError("Gmail request failed after retries", category="provider_network_error") from exc
                 if self.config.retry_backoff_seconds:
                     time.sleep(self.config.retry_backoff_seconds * (2**attempt))
                 continue
@@ -578,9 +641,13 @@ class GmailApiAdapter:
                     time.sleep(self.config.retry_backoff_seconds * (2**attempt))
                 continue
             if not 200 <= response.status_code < 300:
-                raise GmailApiError(_error_detail(response), status_code=response.status_code)
+                raise GmailApiError(
+                    _error_detail(response),
+                    status_code=response.status_code,
+                    category="provider_http_error",
+                )
             return self._decode_json(response) if response.body else {}
-        raise GmailApiError("Gmail request failed after retries") from last_error
+        raise GmailApiError("Gmail request failed after retries", category="provider_network_error") from last_error
 
     def exchange_code(self, code: str, code_verifier: str | None = None) -> GmailTokenResult:
         if not self.config.oauth_configured or not _is_loopback_redirect_uri(self.config.redirect_uri):
@@ -599,14 +666,24 @@ class GmailApiAdapter:
         if code_verifier is None or not (43 <= len(code_verifier) <= 128):
             raise ValueError("OAuth PKCE verifier is invalid")
         form["code_verifier"] = code_verifier
-        payload = self._request(
-            "POST",
-            GMAIL_TOKEN_URL,
-            form=form,
-        )
+        try:
+            payload = self._request(
+                "POST",
+                GMAIL_TOKEN_URL,
+                form=form,
+                # Authorization codes are single-use. Retrying after a
+                # timeout can turn a successful exchange into invalid_grant.
+                retryable=False,
+            )
+        except GmailApiError as exc:
+            category = "oauth_token_exchange_rejected" if exc.status_code is not None else exc.category
+            raise GmailApiError("Gmail authorization-code exchange failed", status_code=exc.status_code, category=category) from exc
         refresh_token = payload.get("refresh_token")
         if not isinstance(refresh_token, str) or not refresh_token.strip():
-            raise GmailApiError("Gmail token response did not contain a usable refresh token")
+            raise GmailApiError(
+                "Gmail token response did not contain a usable refresh token",
+                category="token_response_missing_refresh_token",
+            )
         return self._store_token(payload)
 
     def refresh_access_token(self) -> GmailTokenResult:
@@ -641,13 +718,13 @@ class GmailApiAdapter:
     def _require_secure_storage(self) -> None:
         try:
             self.token_store.load()
-        except SecureStorageUnavailableError as exc:
+        except (SecureStorageUnavailableError, OSError) as exc:
             raise GmailUnavailableError("secure Gmail token storage is unavailable") from exc
 
     def _delete_token_safely(self) -> None:
         try:
             self.token_store.delete()
-        except (AttributeError, SecureStorageUnavailableError):
+        except (AttributeError, SecureStorageUnavailableError, OSError):
             # A mocked legacy store may not implement deletion. The production
             # DPAPI store does, and no token value is included in this path.
             pass
@@ -660,7 +737,10 @@ class GmailApiAdapter:
     ) -> GmailTokenResult:
         access_token = payload.get("access_token")
         if not isinstance(access_token, str) or not access_token.strip():
-            raise GmailApiError("Gmail token response did not contain an access token")
+            raise GmailApiError(
+                "Gmail token response did not contain an access token",
+                category="token_response_missing_access_token",
+            )
         expires_in = payload.get("expires_in")
         expires_at = time.time() + float(expires_in) if isinstance(expires_in, (int, float)) else None
         response_refresh_token = payload.get("refresh_token")
@@ -670,7 +750,10 @@ class GmailApiAdapter:
         raw_scope = payload.get("scope") if isinstance(payload.get("scope"), str) else fallback_scope or ""
         granted_scopes = set(raw_scope.split())
         if not ALLOWED_GMAIL_SCOPES.issubset(granted_scopes):
-            raise GmailApiError("Gmail token response did not grant the required scopes")
+            raise GmailApiError(
+                "Gmail token response did not grant the required scopes",
+                category="token_response_missing_required_scopes",
+            )
         scope = " ".join(scope for scope in DEFAULT_GMAIL_SCOPES if scope in granted_scopes)
         token = GmailToken(
             access_token=access_token,
@@ -681,7 +764,7 @@ class GmailApiAdapter:
         )
         try:
             self.token_store.save(token)
-        except SecureStorageUnavailableError as exc:
+        except (SecureStorageUnavailableError, OSError) as exc:
             raise GmailUnavailableError("secure Gmail token storage is unavailable") from exc
         return GmailTokenResult(expires_at=expires_at, scope=scope, has_refresh_token=bool(refresh_token))
 
@@ -942,10 +1025,15 @@ class _LoopbackCallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         try:
             status_code, body = self.server.handle_callback(self.path, self.client_address[0])
-        except Exception:
+        except Exception as exc:
             # Never reflect request values or provider details through a
             # browser-visible response. The service normally handles all
             # expected failures before this guard is reached.
+            _log_oauth_callback_failure(
+                "unexpected_callback_failure",
+                exc=exc,
+                status_code=400,
+            )
             status_code, body = 400, b"Gmail authorization could not be completed."
         self.send_response(status_code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -1228,37 +1316,46 @@ class GmailService:
         if attempt is None or remote_host != "127.0.0.1":
             if attempt is not None:
                 self._abort_attempt(attempt)
+            _log_oauth_callback_failure("callback_origin_rejected", status_code=403)
             return 403, generic_failure
         try:
             parsed = urlsplit(request_target)
             if parsed.path != "/" or parsed.scheme or parsed.netloc or parsed.fragment or len(parsed.query) > 10000:
                 self._abort_attempt(attempt)
+                _log_oauth_callback_failure("callback_request_invalid", status_code=404)
                 return 404, generic_failure
             values = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=False)
         except ValueError:
             self._abort_attempt(attempt)
+            _log_oauth_callback_failure("callback_request_invalid", status_code=400)
             return 400, generic_failure
 
         states = values.get("state", [])
         if len(states) != 1 or not states[0]:
             self._abort_attempt(attempt)
+            _log_oauth_callback_failure("oauth_state_invalid", status_code=400)
             return 400, generic_failure
         claimed = self._claim_state(states[0])
         if claimed is None or claimed is not attempt:
             self._abort_attempt(attempt)
+            _log_oauth_callback_failure("oauth_state_invalid", status_code=400)
             return 400, generic_failure
 
         errors = values.get("error", [])
         if errors:
             # A valid denial is terminal and deliberately does not disclose the
             # provider's error string or any query values.
+            _log_oauth_callback_failure("provider_denied", status_code=200)
             return 200, b"Gmail authorization was not completed. You may return to LeadPilot."
         codes = values.get("code", [])
         if len(codes) != 1 or not codes[0]:
+            _log_oauth_callback_failure("authorization_code_missing", status_code=400)
             return 400, generic_failure
         try:
             self.adapter(claimed.redirect_uri).exchange_code(codes[0], code_verifier=claimed.verifier)
             self._notify_connected(claimed)
-        except (GmailUnavailableError, GmailApiError, ValueError):
+        except (GmailUnavailableError, GmailApiError, SecureStorageUnavailableError, ValueError) as exc:
+            status_code = exc.status_code if isinstance(exc, GmailApiError) else None
+            _log_oauth_callback_failure(_oauth_failure_category(exc), exc=exc, status_code=status_code)
             return 400, generic_failure
         return 200, generic_success

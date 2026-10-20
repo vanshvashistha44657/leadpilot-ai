@@ -20,6 +20,15 @@ class JsonFormatter(logging.Formatter):
         job_id = getattr(record, "job_id", None)
         if job_id:
             payload["job_id"] = job_id
+        error_category = getattr(record, "error_category", None)
+        if error_category:
+            payload["error_category"] = error_category
+        exception_class = getattr(record, "exception_class", None)
+        if exception_class:
+            payload["exception_class"] = exception_class
+        http_status = getattr(record, "http_status", None)
+        if isinstance(http_status, int) and not isinstance(http_status, bool):
+            payload["http_status"] = http_status
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, default=str)

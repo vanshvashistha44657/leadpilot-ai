@@ -9,6 +9,7 @@ from urllib.request import urlopen
 
 import pytest
 
+from app.logging_config import JsonFormatter
 from app.services.gmail import (
     GmailApiAdapter,
     GmailApiError,
@@ -205,6 +206,123 @@ def test_oauth_consent_denial_is_handled_without_provider_details(client, monkey
     _assert_listener_closed(_listener_port(auth))
 
 
+def test_oauth_token_exchange_rejection_is_generic_and_structured(caplog, client, monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    store = MemoryTokenStore()
+    transport = FakeTransport(
+        [response({"error": "invalid_grant", "error_description": "provider details"}, status_code=400)]
+    )
+    client.app.state.services.gmail.transport = transport
+    client.app.state.services.gmail.token_store_factory = lambda _: store
+
+    auth = client.get("/api/gmail/auth-url", headers={"X-Local-Token": "test-token"})
+    values = parse_qs(urlparse(auth.json()["authorization_url"]).query)
+    state = values["state"][0]
+    authorization_code = "authorization-code-secret"
+    with pytest.raises(HTTPError) as error:
+        urlopen(f'{values["redirect_uri"][0]}?{urlencode({"state": state, "code": authorization_code})}', timeout=2)
+
+    assert error.value.code == 400
+    body = error.value.read().decode()
+    assert "authorization-code-secret" not in body
+    assert "provider details" not in body
+    assert store.token is None
+    records = [record for record in caplog.records if record.getMessage() == "gmail_oauth_callback_failed"]
+    assert records
+    assert records[-1].error_category == "oauth_token_exchange_rejected"
+    assert records[-1].exception_class == "GmailApiError"
+    assert records[-1].http_status == 400
+    formatted = json.loads(JsonFormatter().format(records[-1]))
+    assert formatted["error_category"] == "oauth_token_exchange_rejected"
+    assert formatted["exception_class"] == "GmailApiError"
+    assert formatted["http_status"] == 400
+    assert authorization_code not in caplog.text
+    assert state not in caplog.text
+    assert "provider details" not in caplog.text
+    _assert_listener_closed(urlparse(values["redirect_uri"][0]).port)
+
+
+@pytest.mark.parametrize(
+    ("payload", "category"),
+    [
+        (
+            {"access_token": "access", "refresh_token": "refresh", "scope": GMAIL_COMPOSE_SCOPE},
+            "token_response_missing_required_scopes",
+        ),
+        (
+            {"access_token": "access", "scope": GMAIL_SCOPE_RESPONSE},
+            "token_response_missing_refresh_token",
+        ),
+    ],
+)
+def test_oauth_callback_rejects_incomplete_token_response_without_saving(caplog, client, monkeypatch, payload, category):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    store = MemoryTokenStore()
+    transport = FakeTransport([response(payload)])
+    client.app.state.services.gmail.transport = transport
+    client.app.state.services.gmail.token_store_factory = lambda _: store
+
+    auth = client.get("/api/gmail/auth-url", headers={"X-Local-Token": "test-token"})
+    values = parse_qs(urlparse(auth.json()["authorization_url"]).query)
+    state = values["state"][0]
+    with pytest.raises(HTTPError) as error:
+        urlopen(f'{values["redirect_uri"][0]}?{urlencode({"state": state, "code": "authorization-code"})}', timeout=2)
+
+    assert error.value.code == 400
+    assert "authorization-code" not in error.value.read().decode()
+    assert store.token is None
+    records = [record for record in caplog.records if record.getMessage() == "gmail_oauth_callback_failed"]
+    assert records[-1].error_category == category
+    assert records[-1].exception_class == "GmailApiError"
+
+
+def test_oauth_callback_storage_failure_is_generic_and_sanitized(caplog, client, monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+
+    class FailingStore(MemoryTokenStore):
+        def save(self, token):
+            raise SecureStorageUnavailableError("storage path details")
+
+    store = FailingStore()
+    transport = FakeTransport([response({"access_token": "access", "refresh_token": "refresh", "scope": GMAIL_SCOPE_RESPONSE})])
+    client.app.state.services.gmail.transport = transport
+    client.app.state.services.gmail.token_store_factory = lambda _: store
+
+    auth = client.get("/api/gmail/auth-url", headers={"X-Local-Token": "test-token"})
+    values = parse_qs(urlparse(auth.json()["authorization_url"]).query)
+    with pytest.raises(HTTPError) as error:
+        urlopen(f'{values["redirect_uri"][0]}?{urlencode({"state": values["state"][0], "code": "authorization-code"})}', timeout=2)
+
+    assert error.value.code == 400
+    assert "storage path details" not in error.value.read().decode()
+    records = [record for record in caplog.records if record.getMessage() == "gmail_oauth_callback_failed"]
+    assert records[-1].error_category == "secure_storage_unavailable"
+    assert records[-1].exception_class == "GmailUnavailableError"
+    assert "storage path details" not in caplog.text
+
+
+def test_oauth_callback_rejects_invalid_state_without_exchange_and_logs_safe_category(caplog, client, monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    transport = FakeTransport([])
+    client.app.state.services.gmail.transport = transport
+    client.app.state.services.gmail.token_store_factory = lambda _: MemoryTokenStore()
+
+    auth = client.get("/api/gmail/auth-url", headers={"X-Local-Token": "test-token"})
+    values = parse_qs(urlparse(auth.json()["authorization_url"]).query)
+    with pytest.raises(HTTPError) as error:
+        urlopen(
+            f'{values["redirect_uri"][0]}?{urlencode({"state": "attacker-state", "code": "authorization-code"})}',
+            timeout=2,
+        )
+
+    assert error.value.code == 400
+    assert "attacker-state" not in error.value.read().decode()
+    assert transport.calls == []
+    records = [record for record in caplog.records if record.getMessage() == "gmail_oauth_callback_failed"]
+    assert records[-1].error_category == "oauth_state_invalid"
+    assert not hasattr(records[-1], "exception_class")
+
+
 def test_invalid_loopback_callback_is_generic_and_closes_the_bound_listener(monkeypatch):
     monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
     store = MemoryTokenStore()
@@ -320,6 +438,27 @@ def test_token_exchange_fails_closed_before_saving_incomplete_offline_credential
     adapter = GmailApiAdapter(config, transport=transport, token_store=store)
     with pytest.raises(GmailApiError):
         adapter.exchange_code("code", code_verifier="v" * 64)
+    assert store.token is None
+
+
+def test_authorization_code_exchange_is_not_retried_after_a_provider_failure():
+    store = MemoryTokenStore()
+    transport = FakeTransport([response({"error": "temporarily unavailable"}, status_code=503), response({})])
+    config = GmailConfig(
+        client_id="client-id",
+        client_secret="",
+        redirect_uri="http://127.0.0.1:49152",
+        max_retries=3,
+        retry_backoff_seconds=0,
+    )
+    adapter = GmailApiAdapter(config, transport=transport, token_store=store)
+
+    with pytest.raises(GmailApiError) as error:
+        adapter.exchange_code("code", code_verifier="v" * 64)
+
+    assert error.value.category == "oauth_token_exchange_rejected"
+    assert error.value.status_code == 503
+    assert len(transport.calls) == 1
     assert store.token is None
 
 
