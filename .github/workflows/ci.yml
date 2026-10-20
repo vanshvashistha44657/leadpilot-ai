@@ -102,6 +102,11 @@ jobs:
           $python = (Get-Command python.exe -ErrorAction Stop).Source
           & .\scripts\package_windows.ps1 -PythonExecutable $python
 
+      - name: Verify launcher configuration safety contract
+        shell: pwsh
+        run: |
+          & .\scripts\test_launcher_config.ps1
+
       - name: Run packaged backend lifecycle smoke check
         shell: pwsh
         run: |

@@ -6,6 +6,7 @@ param(
   [switch]$LaunchFrontend,
   [switch]$LaunchFlutter,
   [switch]$VerifyOnly,
+  [switch]$VerifyConfigOnly,
   [switch]$KeepBackend,
   [int]$FrontendTimeoutSeconds = 0,
   [string]$FrontendShutdownEventName = ""
@@ -45,8 +46,9 @@ function Write-DefaultConfig {
   param([string]$PathValue)
 
   @'
-# LeadPilot per-user configuration. Provider credentials remain environment-only
-# and are never persisted by the installed launcher.
+# LeadPilot per-user configuration. Provider secrets remain environment-only
+# and are never persisted by the installed launcher. The OAuth client ID is
+# public metadata and may be supplied here for the Desktop loopback flow.
 EMAIL_PROVIDER=mock
 LOG_LEVEL=INFO
 IMPORT_BATCH_SIZE=100
@@ -56,6 +58,7 @@ AI_BASE_URL=https://api.openai.com/v1
 AI_TIMEOUT_SECONDS=20
 AI_MAX_RETRIES=2
 AI_RETRY_BACKOFF_SECONDS=0.25
+GMAIL_CLIENT_ID=
 GMAIL_SCOPES=https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly
 GMAIL_TIMEOUT_SECONDS=20
 GMAIL_MAX_RETRIES=2
@@ -70,7 +73,7 @@ function Import-UserConfig {
     "EMAIL_PROVIDER", "LOG_LEVEL", "IMPORT_BATCH_SIZE",
     "AI_PROVIDER", "AI_MODEL", "AI_BASE_URL",
     "AI_TIMEOUT_SECONDS", "AI_MAX_RETRIES", "AI_RETRY_BACKOFF_SECONDS",
-    "GMAIL_SCOPES",
+    "GMAIL_CLIENT_ID", "GMAIL_SCOPES",
     "GMAIL_TIMEOUT_SECONDS", "GMAIL_MAX_RETRIES", "GMAIL_RETRY_BACKOFF_SECONDS",
     "GMAIL_LIVE_SEND_APPROVED", "GMAIL_LIVE_SEND_TESTED"
   )
@@ -231,6 +234,9 @@ if ($LaunchFlutter -and $LaunchFrontend) {
 if ($VerifyOnly -and ($LaunchFlutter -or $LaunchFrontend)) {
   throw "-VerifyOnly cannot be combined with a frontend launch option."
 }
+if ($VerifyConfigOnly -and ($VerifyOnly -or $LaunchFlutter -or $LaunchFrontend -or $KeepBackend)) {
+  throw "-VerifyConfigOnly cannot be combined with backend or frontend launch options."
+}
 if (-not [string]::IsNullOrWhiteSpace($FrontendShutdownEventName) -and
     $FrontendShutdownEventName -notmatch '^Local\\LeadPilot-Smoke-[0-9a-fA-F]+$') {
   throw "-FrontendShutdownEventName must be a verifier-created local smoke-test event."
@@ -302,6 +308,19 @@ $env:DRY_RUN = "true"
 $env:LIVE_SENDING_ENABLED = "false"
 $env:GMAIL_LIVE_SEND_APPROVED = "false"
 $env:GMAIL_LIVE_SEND_TESTED = "false"
+
+if ($VerifyConfigOnly) {
+  [ordered]@{
+    gmail_client_id_configured = -not [string]::IsNullOrWhiteSpace($env:GMAIL_CLIENT_ID)
+    gmail_client_secret_imported = -not [string]::IsNullOrWhiteSpace($env:GMAIL_CLIENT_SECRET)
+    gmail_redirect_uri_imported = -not [string]::IsNullOrWhiteSpace($env:GMAIL_REDIRECT_URI)
+    dry_run = $env:DRY_RUN
+    live_sending_enabled = $env:LIVE_SENDING_ENABLED
+    gmail_live_send_approved = $env:GMAIL_LIVE_SEND_APPROVED
+    gmail_live_send_tested = $env:GMAIL_LIVE_SEND_TESTED
+  } | ConvertTo-Json -Compress
+  exit 0
+}
 
 if ([string]::IsNullOrWhiteSpace($LocalToken)) {
   $LocalToken = New-LocalToken

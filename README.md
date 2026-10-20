@@ -258,9 +258,11 @@ creation, and outreach preview.
 
 ### Phase 3 Gmail setup, scopes, and token storage
 
-Create a **Desktop app** OAuth client in Google Cloud, then set its client ID and
-sender identity in the backend process environment. A client secret is optional
-for this loopback Desktop flow. Do not set a fixed `GMAIL_REDIRECT_URI`: each
+Create a **Desktop app** OAuth client in Google Cloud, then set its client ID in
+the per-user `config\backend.env` file or the backend process environment. The
+launcher permits `GMAIL_CLIENT_ID` but keeps the client secret environment-only.
+A client secret is optional for this loopback Desktop flow. Do not set a fixed
+`GMAIL_REDIRECT_URI`: each
 authenticated `GET /api/gmail/auth-url` binds an available port on
 `127.0.0.1`, returns a Google URL containing exactly
 `http://127.0.0.1:<runtime-port>`, and uses that same URI in the token exchange.
@@ -430,6 +432,10 @@ From `backend/`:
 ```text
 python -m pytest                 86 passed, 1 dependency deprecation warning
 python -m compileall -q app tests passed
+
+scripts\test_launcher_config.ps1 passed: GMAIL_CLIENT_ID imports from the
+per-user config, client secret and fixed redirect values do not, and launcher
+safety overrides remain enforced.
 ```
 
 An actual backend server smoke check also passed: readiness returned `ready`, database `ok`, migration `6`, and an unauthenticated dashboard request returned `401`. The synthetic smoke workflow also created a lead, rendered a dry-run preview, completed a background job, and read back lead history.

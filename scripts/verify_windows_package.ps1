@@ -58,6 +58,16 @@ try {
   if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
     throw "The packaged launcher did not create its persistent user configuration: $config"
   }
+  $configText = Get-Content -LiteralPath $config -Raw
+  if ($configText -notmatch '(?m)^GMAIL_CLIENT_ID\s*=') {
+    throw "The packaged launcher configuration does not permit GMAIL_CLIENT_ID."
+  }
+  if ($configText -match '(?m)^GMAIL_CLIENT_SECRET\s*=') {
+    throw "The packaged launcher configuration must not persist GMAIL_CLIENT_SECRET."
+  }
+  if ($configText -match '(?m)^GMAIL_REDIRECT_URI\s*=') {
+    throw "The packaged launcher configuration must not persist GMAIL_REDIRECT_URI."
+  }
   if (Test-Path -LiteralPath $metadata) {
     throw "The packaged launcher left backend ownership metadata after verification: $metadata"
   }
